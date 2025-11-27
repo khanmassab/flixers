@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Flixers Party</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header class="hero">
+      <div>
+        <p class="eyebrow">Flixers Watch Party</p>
+        <h1>Sync, chat, and stay in flow.</h1>
+        <p class="subtle">Join a room, share the link, and let Flixers keep playback and chat in sync.</p>
+      </div>
+      <div class="pill pill--idle" id="connection-pill">Idle</div>
+    </header>
+
+    <main class="layout">
+      <section class="panel panel--primary">
+        <div class="user-card">
+          <div class="avatar" id="user-avatar">?</div>
+          <div class="user-meta">
+            <p id="user-name" class="user-name">Not signed in</p>
+            <p id="user-email" class="user-email">Sign in to load your Google name</p>
+          </div>
+          <div class="user-actions">
+            <button id="signin" class="pill-btn">Sign in with Google</button>
+            <button id="signout" class="pill-btn muted">Sign out</button>
+          </div>
+        </div>
+        <div class="field-grid">
+          <label>
+            Display name
+            <input id="name" type="text" placeholder="Guest" />
+          </label>
+          <label>
+            Room link (share)
+            <div class="share-row">
+              <input id="room-link" type="text" placeholder="Paste room link or ID" />
+              <button id="copy-link" type="button" class="pill-btn">Copy</button>
+            </div>
+            <p class="hint">Create a room or paste a shared link to join.</p>
+          </label>
+        </div>
+        <div class="actions">
+          <button id="join">Join from link</button>
+          <button id="create" class="ghost">Create new room</button>
+          <button id="leave" class="muted">Leave</button>
+        </div>
+        <div class="status-row">
+          <div>
+            <p class="status-title">Room status</p>
+            <p id="status" class="status">Not connected</p>
+          </div>
+          <div>
+            <p class="status-title">People</p>
+            <div id="presence-chips" class="presence-chips"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel panel--chat">
+        <div class="chat-top">
+          <div>
+            <p class="overline">Live chat</p>
+            <p class="chat-subtitle">Messages stay in this room only.</p>
+          </div>
+          <button id="clear-chat" class="pill-btn">Clear</button>
+        </div>
+        <div id="messages" class="messages"></div>
+        <form id="chat-form" class="chat-form">
+          <input id="chat-input" type="text" placeholder="Say hello to the room" autocomplete="off" />
+          <button type="submit">Send</button>
+        </form>
+      </section>
+    </main>
+
+    <div id="toast-stack" class="toast-stack"></div>
+    <script src="popup.js" type="module"></script>
+  </body>
+</html>

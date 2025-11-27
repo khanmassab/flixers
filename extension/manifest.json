@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "Flixers Watch Party",
+  "description": "Sync Netflix playback and chat with friends.",
+  "version": "0.1.0",
+  "action": {
+    "default_title": "Flixers Watch Party",
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "permissions": ["storage", "identity"],
+  "host_permissions": ["*://*.netflix.com/*", "http://localhost:4000/*", "https://localhost:4000/*"],
+  "content_scripts": [
+    {
+      "matches": ["*://*.netflix.com/*"],
+      "js": ["content-script.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
