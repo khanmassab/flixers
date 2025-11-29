@@ -40,6 +40,24 @@
             <p class="hint">Paste a shared link to join instantly, or create a new room.</p>
           </label>
         </div>
+        
+        <!-- Join confirmation panel (shown after pasting room link) -->
+        <div id="join-preview" class="join-preview hidden">
+          <div class="preview-card">
+            <div class="preview-icon">🎬</div>
+            <div class="preview-info">
+              <p class="preview-title">Ready to join?</p>
+              <p id="preview-video" class="preview-video">Netflix Video</p>
+              <p id="preview-time" class="preview-time">Starting at 0:00</p>
+              <p id="preview-participants" class="preview-participants">0 watching</p>
+            </div>
+          </div>
+          <div class="preview-actions">
+            <button id="confirm-join" class="pill-btn pill-btn--large">Join &amp; Open Video</button>
+            <button id="cancel-join" class="muted">Cancel</button>
+          </div>
+        </div>
+        
         <div class="actions">
           <button id="leave" class="muted hidden">Leave</button>
         </div>
@@ -53,21 +71,6 @@
             <div id="presence-chips" class="presence-chips"></div>
           </div>
         </div>
-      </section>
-
-      <section class="panel panel--chat hidden" id="chat-panel">
-        <div class="chat-top">
-          <div>
-            <p class="overline">Live chat</p>
-            <p class="chat-subtitle">Messages stay in this room only.</p>
-          </div>
-          <button id="clear-chat" class="pill-btn">Clear</button>
-        </div>
-        <div id="messages" class="messages"></div>
-        <form id="chat-form" class="chat-form">
-          <input id="chat-input" type="text" placeholder="Say hello to the room" autocomplete="off" />
-          <button type="submit">Send</button>
-        </form>
       </section>
     </main>
 

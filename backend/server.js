@@ -6,6 +6,15 @@ const { WebSocketServer } = require("ws");
 const { OAuth2Client } = require("google-auth-library");
 const jwt = require("jsonwebtoken");
 
+// Redis integration with fallback
+let redis = null;
+try {
+  redis = require("./redis");
+  console.log("[Redis] Module loaded, will attempt connection");
+} catch (err) {
+  console.warn("[Redis] Module not available, using in-memory storage only");
+}
+
 const PORT = process.env.PORT || 4000;
 const JWT_SECRET = process.env.JWT_SECRET || "dev-secret";
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
@@ -15,7 +24,11 @@ app.use(cors());
 app.use(express.json());
 
 const oauthClient = new OAuth2Client(GOOGLE_CLIENT_ID || undefined);
-const rooms = new Map(); // roomId -> { clients: Set<{ socket, name, sub }>, encryptionRequired: boolean }
+// In-memory room storage: roomId -> { clients, encryptionRequired, videoUrl, titleId, initialTime, deletionTimer }
+const rooms = new Map();
+
+// Room cleanup delay - keep empty rooms for 1 day before deletion
+const ROOM_CLEANUP_DELAY = 24 * 60 * 60 * 1000; // 1 day in milliseconds
 
 app.post("/auth/google", async (req, res) => {
   const idToken = req.body?.idToken;
@@ -33,35 +46,156 @@ app.post("/auth/google", async (req, res) => {
   }
 });
 
-app.post("/rooms", authRequired, (req, res) => {
+app.post("/rooms", authRequired, async (req, res) => {
   const roomId = randomUUID().slice(0, 8);
   const encryptionRequired = coerceBoolean(
     req.body?.encryptionRequired,
     defaultEncryptionRequired()
   );
-  ensureRoom(roomId, { encryptionRequired });
+  
+  // Extract video metadata from request
+  const videoUrl = req.body?.videoUrl || "";
+  const titleId = extractTitleId(videoUrl);
+  const initialTime = Math.floor(Number(req.body?.videoTime) || 0);
+  
+  const roomOpts = { encryptionRequired, videoUrl, titleId, initialTime };
+  
+  // Store in Redis if available
+  if (redis && redis.isRedisConnected()) {
+    try {
+      await redis.createRoom(roomId, roomOpts);
+      console.log(`[Room] Created ${roomId} in Redis (video: ${titleId}, time: ${initialTime}s)`);
+    } catch (err) {
+      console.warn("[Redis] Failed to create room, using memory:", err.message);
+    }
+  }
+  
+  // Always store in memory for WebSocket clients
+  ensureRoom(roomId, roomOpts);
+  
   res.json({
     roomId,
     encryptionRequired,
+    videoUrl,
+    titleId,
+    initialTime,
     user: sanitizeProfile(req.user),
   });
 });
 
-app.post("/rooms/:id/join", authRequired, (req, res) => {
+app.post("/rooms/:id/join", authRequired, async (req, res) => {
   const { id } = req.params;
+  
+  // Try Redis first, then memory
+  let roomData = null;
+  if (redis && redis.isRedisConnected()) {
+    try {
+      roomData = await redis.getRoom(id);
+    } catch (err) {
+      console.warn("[Redis] Failed to get room:", err.message);
+    }
+  }
+  
   const room = rooms.get(id);
-  if (!room) {
+  if (!room && !roomData) {
     return res.status(404).json({ error: "Room not found" });
   }
+  
+  // Merge Redis data with memory data (memory takes precedence for live state)
+  const videoUrl = room?.videoUrl || roomData?.videoUrl || "";
+  const titleId = room?.titleId || roomData?.titleId || extractTitleId(videoUrl);
+  const initialTime = room?.initialTime ?? roomData?.videoTime ?? 0;
+  const encryptionRequired = room?.encryptionRequired ?? roomData?.encryptionRequired ?? false;
+  
   res.json({
     roomId: id,
     name: req.user?.name || "Guest",
-    encryptionRequired: room.encryptionRequired,
+    encryptionRequired,
+    videoUrl,
+    titleId,
+    initialTime,
+  });
+});
+
+// Preview room info without joining (for confirmation step)
+app.get("/rooms/:id/preview", authRequired, async (req, res) => {
+  const { id } = req.params;
+  
+  // Try Redis first, then memory
+  let roomData = null;
+  if (redis && redis.isRedisConnected()) {
+    try {
+      roomData = await redis.getRoom(id);
+    } catch (err) {
+      console.warn("[Redis] Failed to get room for preview:", err.message);
+    }
+  }
+  
+  const room = rooms.get(id);
+  if (!room && !roomData) {
+    return res.status(404).json({ error: "Room not found" });
+  }
+  
+  const videoUrl = room?.videoUrl || roomData?.videoUrl || "";
+  const titleId = room?.titleId || roomData?.titleId || extractTitleId(videoUrl);
+  const initialTime = room?.initialTime ?? roomData?.videoTime ?? 0;
+  const participantCount = room?.clients?.size || 0;
+  
+  res.json({
+    roomId: id,
+    videoUrl,
+    titleId,
+    initialTime,
+    participantCount,
+    exists: true,
   });
 });
 
 const server = createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws" });
+
+// Connection keepalive configuration
+const PING_INTERVAL = 25000; // Send ping every 25 seconds (matching client)
+const ACTIVITY_TIMEOUT = 60000; // Consider connection dead after 60s of no activity
+
+// Start server-side ping interval - uses both native ping AND checks activity
+const pingInterval = setInterval(() => {
+  const now = Date.now();
+  
+  wss.clients.forEach((socket) => {
+    // Check activity timeout first
+    const lastActivity = socket.lastActivity || 0;
+    const timeSinceActivity = now - lastActivity;
+    
+    if (timeSinceActivity > ACTIVITY_TIMEOUT) {
+      console.log(`[WS] Terminating inactive connection (no activity for ${Math.round(timeSinceActivity / 1000)}s)`);
+      return socket.terminate();
+    }
+    
+    // Check if native ping was answered
+    if (socket.isAlive === false) {
+      console.log("[WS] Terminating stale connection (no pong response)");
+      return socket.terminate();
+    }
+    
+    // Send native ping and mark as waiting for pong
+    socket.isAlive = false;
+    socket.ping();
+    
+    // Also send JSON ping for clients that may not respond to native pings
+    if (socket.readyState === 1) {
+      try {
+        socket.send(JSON.stringify({ type: "ping", ts: now }));
+      } catch (err) {
+        console.warn("[WS] Failed to send JSON ping:", err.message);
+      }
+    }
+  });
+}, PING_INTERVAL);
+
+wss.on("close", () => {
+  clearInterval(pingInterval);
+});
 
 wss.on("connection", (socket, req) => {
   const params = new URL(req.url, `http://${req.headers.host}`).searchParams;
@@ -80,15 +214,46 @@ wss.on("connection", (socket, req) => {
   }
 
   const name = session.name || "Guest";
+  const picture = session.picture || null;
   const room = ensureRoom(roomId);
-  const client = { socket, name, sub: session.sub };
+  const client = { socket, name, sub: session.sub, picture };
   room.clients.add(client);
+  
+  // Mark connection as alive
+  socket.isAlive = true;
+  socket.lastActivity = Date.now();
+  
   console.log(`[join] ${name} -> ${roomId} (enc=${room.encryptionRequired})`);
   broadcastPresence(roomId);
 
+  // Handle WebSocket native pong (response to our ping)
+  socket.on("pong", () => {
+    socket.isAlive = true;
+    socket.lastActivity = Date.now();
+  });
+
   socket.on("message", (raw) => {
+    // Mark connection as alive on ANY message received
+    socket.isAlive = true;
+    socket.lastActivity = Date.now();
+    
     try {
       const msg = JSON.parse(raw.toString());
+      
+      // Handle client-initiated ping - respond AND keep connection alive
+      if (msg.type === "ping") {
+        if (socket.readyState === 1) {
+          socket.send(JSON.stringify({ type: "pong", ts: Date.now() }));
+        }
+        return;
+      }
+      
+      // Handle pong responses to our server-initiated pings
+      if (msg.type === "pong") {
+        // Connection is definitely alive, already tracked via socket.isAlive
+        return;
+      }
+      
       handleMessage(roomId, client, msg);
     } catch (err) {
       console.warn("Bad message", err);
@@ -101,9 +266,28 @@ wss.on("connection", (socket, req) => {
     currentRoom.clients.delete(client);
     console.log(`[leave] ${name} -> ${roomId}`);
     broadcastPresence(roomId);
+    
+    // Schedule room cleanup when empty (after 1 hour delay)
     if (currentRoom.clients.size === 0) {
-      rooms.delete(roomId);
+      // Clear any existing deletion timer
+      if (currentRoom.deletionTimer) {
+        clearTimeout(currentRoom.deletionTimer);
+      }
+      
+      console.log(`[Room] ${roomId} is now empty, scheduling deletion in 1 hour`);
+      currentRoom.deletionTimer = setTimeout(() => {
+        const room = rooms.get(roomId);
+        // Only delete if still empty
+        if (room && room.clients.size === 0) {
+          console.log(`[Room] Deleting empty room ${roomId} after timeout`);
+          rooms.delete(roomId);
+        }
+      }, ROOM_CLEANUP_DELAY);
     }
+  });
+
+  socket.on("error", (err) => {
+    console.warn(`[WS] Socket error for ${name} in ${roomId}:`, err.message);
   });
 });
 
@@ -114,6 +298,7 @@ function start(port = PORT) {
 }
 
 function stop(cb) {
+  clearInterval(pingInterval);
   wss.close(() => server.close(cb));
 }
 
@@ -127,15 +312,47 @@ function ensureRoom(roomId, opts = {}) {
       opts.encryptionRequired,
       defaultEncryptionRequired()
     );
-    rooms.set(roomId, { clients: new Set(), encryptionRequired });
-  } else if (opts.encryptionRequired !== undefined) {
+    rooms.set(roomId, {
+      clients: new Set(),
+      encryptionRequired,
+      videoUrl: opts.videoUrl || "",
+      titleId: opts.titleId || "",
+      initialTime: opts.initialTime || 0,
+      deletionTimer: null,
+    });
+  } else {
     const room = rooms.get(roomId);
-    room.encryptionRequired = coerceBoolean(
-      opts.encryptionRequired,
-      room.encryptionRequired
-    );
+    
+    // Cancel any pending deletion timer (someone is joining)
+    if (room.deletionTimer) {
+      console.log(`[Room] Cancelling deletion timer for ${roomId} - user joining`);
+      clearTimeout(room.deletionTimer);
+      room.deletionTimer = null;
+    }
+    
+    if (opts.encryptionRequired !== undefined) {
+      room.encryptionRequired = coerceBoolean(
+        opts.encryptionRequired,
+        room.encryptionRequired
+      );
+    }
+    // Update video metadata if provided
+    if (opts.videoUrl !== undefined) room.videoUrl = opts.videoUrl;
+    if (opts.titleId !== undefined) room.titleId = opts.titleId;
+    if (opts.initialTime !== undefined) room.initialTime = opts.initialTime;
   }
   return rooms.get(roomId);
+}
+
+// Extract Netflix title ID from URL
+function extractTitleId(url) {
+  if (!url) return "";
+  try {
+    const match = url.match(/netflix\.com\/watch\/(\d+)/);
+    return match ? match[1] : "";
+  } catch (_) {
+    return "";
+  }
 }
 
 function handleMessage(roomId, client, msg) {
@@ -143,7 +360,12 @@ function handleMessage(roomId, client, msg) {
 
   const encryptionRequired = isEncryptionRequired(roomId);
   const allowsPlaintext =
-    msg.type === "encrypted" || msg.type === "key-exchange" || !encryptionRequired;
+    msg.type === "encrypted" ||
+    msg.type === "key-exchange" ||
+    msg.type === "system" ||
+    msg.type === "sync-request" ||  // Allow sync messages even in encrypted rooms
+    msg.type === "sync-state" ||     // Allow sync messages even in encrypted rooms
+    !encryptionRequired;
 
   if (!allowsPlaintext) {
     console.warn(
@@ -157,10 +379,24 @@ function handleMessage(roomId, client, msg) {
     return;
   }
   if (msg.type === "chat") {
+    const ts = typeof msg.ts === "number" ? msg.ts : Date.now();
     broadcast(
       roomId,
-      { type: "chat", text: msg.text, from: client.name, ts: Date.now() },
+      { type: "chat", text: msg.text, from: client.name, ts },
       null
+    );
+    return;
+  }
+  if (msg.type === "system") {
+    const ts = typeof msg.ts === "number" ? msg.ts : Date.now();
+    broadcast(roomId, { type: "system", text: msg.text, ts }, null);
+    return;
+  }
+  if (msg.type === "typing") {
+    broadcast(
+      roomId,
+      { type: "typing", from: client.name, active: !!msg.active, ts: Date.now() },
+      client
     );
     return;
   }
@@ -198,6 +434,45 @@ function handleMessage(roomId, client, msg) {
     );
     return;
   }
+  
+  // Sync handshake: joiner requests current state from peers
+  if (msg.type === "sync-request") {
+    console.log(`[Sync] ${client.name} requesting sync in ${roomId}`);
+    broadcast(
+      roomId,
+      {
+        type: "sync-request",
+        from: client.name,
+        ts: Date.now(),
+      },
+      client
+    );
+    return;
+  }
+  
+  // Sync handshake: peer responds with current playback state
+  if (msg.type === "sync-state") {
+    const { time, paused, url } = msg;
+    console.log(`[Sync] ${client.name} responding with state: t=${time}, paused=${paused}`);
+    broadcast(
+      roomId,
+      {
+        type: "sync-state",
+        time: typeof time === "number" ? time : 0,
+        paused: typeof paused === "boolean" ? paused : true,
+        url: isNonEmptyString(url) ? url : "",
+        from: client.name,
+        ts: Date.now(),
+      },
+      client
+    );
+    
+    // Update room's video state in Redis if available
+    if (redis && redis.isRedisConnected() && url) {
+      redis.updateRoomVideoState(roomId, url, time).catch(() => {});
+    }
+    return;
+  }
 }
 
 function broadcast(roomId, message, skipClient) {
@@ -216,9 +491,15 @@ function broadcastPresence(roomId) {
   const room = rooms.get(roomId);
   if (!room) return;
   const users = Array.from(room.clients).map((c) => c.name);
+  const avatars = {};
+  room.clients.forEach((c) => {
+    if (c.picture) {
+      avatars[c.name] = c.picture;
+    }
+  });
   broadcast(
     roomId,
-    { type: "presence", users, encryptionRequired: room.encryptionRequired },
+    { type: "presence", users, avatars, encryptionRequired: room.encryptionRequired },
     null
   );
 }
@@ -326,3 +607,4 @@ module.exports = {
   verifySessionToken,
   issueSessionToken,
 };
+

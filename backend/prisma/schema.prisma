@@ -1,0 +1,86 @@
+// Prisma schema for Flixers
+// Docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "linux-arm64-openssl-3.0.x", "debian-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String   @id // Google 'sub' claim
+  email     String   @unique
+  name      String
+  picture   String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  preferences  UserPreferences?
+  roomHistory  RoomHistory[]
+  
+  // Friendships where this user initiated
+  sentFriendships     Friendship[] @relation("SentFriendships")
+  // Friendships where this user received
+  receivedFriendships Friendship[] @relation("ReceivedFriendships")
+
+  @@map("users")
+}
+
+model UserPreferences {
+  id                   String  @id @default(cuid())
+  userId               String  @unique
+  theme                String  @default("system") // "light", "dark", "system"
+  notificationsEnabled Boolean @default(true)
+  defaultEncryption    Boolean @default(true)
+
+  // Relation
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("user_preferences")
+}
+
+model RoomHistory {
+  id       String    @id @default(cuid())
+  userId   String
+  roomId   String
+  roomName String?
+  joinedAt DateTime  @default(now())
+  leftAt   DateTime?
+
+  // Relation
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([roomId])
+  @@map("room_history")
+}
+
+model Friendship {
+  id        String           @id @default(cuid())
+  userId    String           // The user who sent the request
+  friendId  String           // The user who received the request
+  status    FriendshipStatus @default(PENDING)
+  createdAt DateTime         @default(now())
+  updatedAt DateTime         @updatedAt
+
+  // Relations
+  user   User @relation("SentFriendships", fields: [userId], references: [id], onDelete: Cascade)
+  friend User @relation("ReceivedFriendships", fields: [friendId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, friendId])
+  @@index([userId])
+  @@index([friendId])
+  @@map("friendships")
+}
+
+enum FriendshipStatus {
+  PENDING
+  ACCEPTED
+  BLOCKED
+}
+

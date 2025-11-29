@@ -238,6 +238,35 @@ button:disabled {
   box-shadow: none;
 }
 
+button.loading {
+  position: relative;
+  color: transparent;
+}
+
+button.loading::after {
+  content: "";
+  position: absolute;
+  width: 16px;
+  height: 16px;
+  top: 50%;
+  left: 50%;
+  margin-left: -8px;
+  margin-top: -8px;
+  border: 2px solid transparent;
+  border-top-color: #0b0e15;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+input:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
 button.ghost {
   background: transparent;
   color: var(--text);
@@ -320,6 +349,12 @@ button.muted {
   background: rgba(255, 111, 97, 0.12);
   border-color: #ff6f61;
   color: #ff6f61;
+}
+
+.pill--warn {
+  background: rgba(255, 178, 122, 0.14);
+  border-color: #ffb27a;
+  color: #ffb27a;
 }
 
 .chat-top {
@@ -443,6 +478,92 @@ button.muted {
 
 .toast--warn {
   border-color: #ff6f61;
+}
+
+/* Join Preview Section */
+.join-preview {
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: linear-gradient(135deg, rgba(110, 242, 196, 0.08), rgba(255, 111, 97, 0.05));
+}
+
+.preview-card {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  padding: 10px;
+  background: #0c101c;
+  border: 1px dashed var(--border);
+  border-radius: 12px;
+  margin-bottom: 12px;
+}
+
+.preview-icon {
+  width: 48px;
+  height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 24px;
+  background: linear-gradient(135deg, #ff6f61, #ffb27a);
+  border-radius: 12px;
+}
+
+.preview-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.preview-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.preview-video {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: var(--accent-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.preview-time {
+  margin: 2px 0 0;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.preview-participants {
+  margin: 2px 0 0;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.preview-actions {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+}
+
+.preview-actions .pill-btn--large {
+  flex: 1;
+  background: linear-gradient(135deg, #6ef2c4, #89f7fe);
+  color: #0b0e15;
+  font-weight: 700;
+  border: none;
+  box-shadow: 0 8px 22px rgba(110, 242, 196, 0.22);
+}
+
+.preview-actions .pill-btn--large:hover {
+  transform: translateY(-1px);
+}
+
+.preview-actions .muted {
+  padding: 8px 16px;
 }
 
 @media (max-width: 480px) {

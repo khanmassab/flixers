@@ -1,291 +1,2047 @@
+let h = null;
+let render = null;
+let useEffect = null;
+let useMemo = null;
+let useRef = null;
+let useState = null;
+let html = null;
+
+// Track whether the extension context has been invalidated
+let extensionContextValid = true;
+
+function isContextValid() {
+  try {
+    if (!chrome?.runtime?.id) {
+      extensionContextValid = false;
+      return false;
+    }
+    return extensionContextValid;
+  } catch (_) {
+    extensionContextValid = false;
+    return false;
+  }
+}
+
+function safeSend(message, callback) {
+  if (!isContextValid()) return;
+  try {
+    chrome.runtime.sendMessage(message, (response) => {
+      if (chrome.runtime.lastError) {
+        extensionContextValid = false;
+        return;
+      }
+      if (callback) callback(response);
+    });
+  } catch (_) {
+    extensionContextValid = false;
+  }
+}
+
+// Listen for requests from popup/background
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.type === "get-video-state") {
+    const video = document.querySelector("video");
+    if (video) {
+      sendResponse({
+        t: video.currentTime,
+        paused: video.paused,
+        url: window.location.href,
+      });
+    } else {
+      sendResponse(null);
+    }
+    return true;
+  }
+  
+  // Sync to specific time when joining a room
+  if (message.type === "sync-to-time") {
+    const syncTime = () => {
+      const video = document.querySelector("video");
+      if (video && typeof message.time === "number") {
+        try {
+          video.currentTime = message.time;
+          console.log("[Flixers] Synced to time:", message.time);
+        } catch (err) {
+          console.warn("[Flixers] Failed to sync time:", err);
+        }
+      }
+    };
+    
+    // Try immediately, and retry after delays in case video isn't ready
+    syncTime();
+    setTimeout(syncTime, 1000);
+    setTimeout(syncTime, 2000);
+    setTimeout(syncTime, 4000);
+    
+    sendResponse({ ok: true });
+    return true;
+  }
+});
+
+function safeAddListener(handler) {
+  if (!isContextValid()) return () => {};
+  try {
+    chrome.runtime.onMessage.addListener(handler);
+    return () => {
+      try {
+        if (isContextValid()) {
+          chrome.runtime.onMessage.removeListener(handler);
+        }
+      } catch (_) {}
+    };
+  } catch (_) {
+    extensionContextValid = false;
+    return () => {};
+  }
+}
+
+function storageKey(roomId) {
+  return `flixers-messages-${roomId}`;
+}
+
+function loadGlobals() {
+  const lib = window.htmPreact || window.htm || window.preact || {};
+  h = lib.h || lib.Fragment ? lib.h : null;
+  render = lib.render || null;
+  useEffect = lib.useEffect || null;
+  useMemo = lib.useMemo || null;
+  useRef = lib.useRef || null;
+  useState = lib.useState || null;
+  html = lib.html || (lib.bind ? lib.bind(h) : null) || null;
+}
+
+const BUILTIN_AVATARS = [
+  { emoji: "🎬", bg: "linear-gradient(135deg,#ff9a9e,#fad0c4)" },
+  { emoji: "🍿", bg: "linear-gradient(135deg,#a18cd1,#fbc2eb)" },
+  { emoji: "🎟️", bg: "linear-gradient(135deg,#f6d365,#fda085)" },
+  { emoji: "📺", bg: "linear-gradient(135deg,#5ee7df,#b490ca)" },
+  { emoji: "✨", bg: "linear-gradient(135deg,#cfd9df,#e2ebf0)" },
+  { emoji: "🌠", bg: "linear-gradient(135deg,#89f7fe,#66a6ff)" },
+  { emoji: "🌃", bg: "linear-gradient(135deg,#434343,#000000)" },
+  { emoji: "🎧", bg: "linear-gradient(135deg,#30cfd0,#330867)" },
+  { emoji: "🎉", bg: "linear-gradient(135deg,#fddb92,#d1fdff)" },
+  { emoji: "🧲", bg: "linear-gradient(135deg,#f6d242,#ff52e5)" },
+];
+
+// ============================================================================
+// Netflix Adapter - Abstracts video control for Netflix-specific behavior
+// Uses Netflix's internal Cadmium player API to avoid DRM issues
+// ============================================================================
+
+// Inject script into page context to access Netflix's internal API
+const injectNetflixBridge = (() => {
+  let injectionState = 'idle'; // idle, injecting, ready, failed
+  let injectionAttempts = 0;
+  const MAX_INJECTION_ATTEMPTS = 3;
+  const pendingCallbacks = [];
+  
+  // Check if the bridge is actually working
+  const verifyBridge = () => {
+    return new Promise((resolve) => {
+      const id = Math.random().toString(36).slice(2);
+      let resolved = false;
+      
+      const handler = (e) => {
+        if (e.detail?.id === id && !resolved) {
+          resolved = true;
+          window.removeEventListener('flixers-response', handler);
+          resolve(e.detail.result?.success === true || e.detail.result?.state !== undefined);
+        }
+      };
+      
+      window.addEventListener('flixers-response', handler);
+      
+      // Timeout after 1 second
+      setTimeout(() => {
+        if (!resolved) {
+          resolved = true;
+          window.removeEventListener('flixers-response', handler);
+          resolve(false);
+        }
+      }, 1000);
+      
+      // Send a test command
+      window.dispatchEvent(new CustomEvent('flixers-command', {
+        detail: { action: 'getState', data: {}, id }
+      }));
+    });
+  };
+  
+  const doInject = () => {
+    return new Promise((resolve, reject) => {
+      injectionState = 'injecting';
+      injectionAttempts++;
+      
+      console.log(`[Flixers] Injecting Netflix bridge (attempt ${injectionAttempts}/${MAX_INJECTION_ATTEMPTS})`);
+      
+      const script = document.createElement('script');
+      script.src = chrome.runtime.getURL('netflix-bridge.js');
+      
+      script.onload = async () => {
+        script.remove();
+        console.log('[Flixers] Bridge script loaded, verifying...');
+        
+        // Wait a bit for the script to execute
+        await new Promise(r => setTimeout(r, 100));
+        
+        // Verify the bridge is working
+        const isWorking = await verifyBridge();
+        if (isWorking) {
+          console.log('[Flixers] Netflix bridge verified and working');
+          injectionState = 'ready';
+          resolve(true);
+        } else {
+          console.warn('[Flixers] Bridge loaded but not responding');
+          injectionState = 'failed';
+          reject(new Error('Bridge not responding'));
+        }
+      };
+      
+      script.onerror = (err) => {
+        script.remove();
+        console.error('[Flixers] Failed to load Netflix bridge script:', err);
+        injectionState = 'failed';
+        reject(new Error('Script load failed'));
+      };
+      
+      (document.head || document.documentElement).appendChild(script);
+    });
+  };
+  
+  // Main inject function with retry
+  const inject = async () => {
+    // Already ready
+    if (injectionState === 'ready') {
+      // Double-check the bridge is still working
+      const stillWorking = await verifyBridge();
+      if (stillWorking) return true;
+      
+      console.log('[Flixers] Bridge stopped working, re-injecting...');
+      injectionState = 'idle';
+      injectionAttempts = 0;
+    }
+    
+    // Already injecting, wait for result
+    if (injectionState === 'injecting') {
+      return new Promise((resolve) => {
+        pendingCallbacks.push(resolve);
+      });
+    }
+    
+    // Try to inject with retries
+    while (injectionAttempts < MAX_INJECTION_ATTEMPTS) {
+      try {
+        await doInject();
+        // Notify any pending callbacks
+        pendingCallbacks.forEach(cb => cb(true));
+        pendingCallbacks.length = 0;
+        return true;
+      } catch (err) {
+        console.warn(`[Flixers] Bridge injection attempt ${injectionAttempts} failed:`, err.message);
+        
+        if (injectionAttempts < MAX_INJECTION_ATTEMPTS) {
+          // Wait before retry with exponential backoff
+          const delay = 300 * Math.pow(2, injectionAttempts - 1);
+          console.log(`[Flixers] Retrying bridge injection in ${delay}ms...`);
+          await new Promise(r => setTimeout(r, delay));
+          injectionState = 'idle'; // Reset for retry
+        }
+      }
+    }
+    
+    console.error('[Flixers] Failed to inject bridge after all attempts');
+    pendingCallbacks.forEach(cb => cb(false));
+    pendingCallbacks.length = 0;
+    return false;
+  };
+  
+  // Force re-injection (useful when CSP errors detected)
+  const forceReinject = () => {
+    console.log('[Flixers] Force re-injection requested');
+    injectionState = 'idle';
+    injectionAttempts = 0;
+    return inject();
+  };
+  
+  const getState = () => injectionState;
+  
+  return { inject, forceReinject, getState, verifyBridge };
+})();
+
+// Call the Netflix API via the injected bridge with retry and reconnection support
+const callNetflixAPI = async (action, data = {}, retries = 3) => {
+  let attempts = 0;
+  let reinjectAttempted = false;
+  
+  const attemptCall = () => {
+    return new Promise((resolve) => {
+      attempts++;
+      const id = Math.random().toString(36).slice(2);
+      let resolved = false;
+      
+      const handler = (e) => {
+        if (e.detail?.id === id && !resolved) {
+          resolved = true;
+          window.removeEventListener('flixers-response', handler);
+          resolve(e.detail.result);
+        }
+      };
+      
+      window.addEventListener('flixers-response', handler);
+      
+      // Timeout after 2 seconds
+      setTimeout(() => {
+        if (!resolved) {
+          resolved = true;
+          window.removeEventListener('flixers-response', handler);
+          resolve({ success: false, error: 'Timeout', isTimeout: true });
+        }
+      }, 2000);
+      
+      window.dispatchEvent(new CustomEvent('flixers-command', {
+        detail: { action, data, id }
+      }));
+    });
+  };
+  
+  while (attempts <= retries) {
+    // Ensure bridge is injected before each attempt
+    const bridgeState = injectNetflixBridge.getState();
+    if (bridgeState !== 'ready') {
+      console.log(`[NetflixAPI] Bridge not ready (state: ${bridgeState}), injecting...`);
+      const injected = await injectNetflixBridge.inject();
+      if (!injected) {
+        console.error('[NetflixAPI] Failed to inject bridge');
+        return { success: false, error: 'Bridge injection failed' };
+      }
+    }
+    
+    const result = await attemptCall();
+    
+    // Success - return result
+    if (result.success) {
+      return result;
+    }
+    
+    // Timeout might indicate bridge died (CSP issue or page navigation)
+    if (result.isTimeout && !reinjectAttempted) {
+      console.log('[NetflixAPI] Timeout detected, attempting bridge re-injection...');
+      reinjectAttempted = true;
+      
+      // Force re-inject the bridge
+      const reinjected = await injectNetflixBridge.forceReinject();
+      if (reinjected) {
+        console.log('[NetflixAPI] Bridge re-injected, retrying...');
+        // Don't count this as an attempt, give it another chance
+        attempts--;
+      }
+    }
+    
+    // More attempts left
+    if (attempts < retries) {
+      console.log(`[NetflixAPI] ${action} failed (${result.error}), retrying (${attempts}/${retries})...`);
+      await new Promise(r => setTimeout(r, 300 * attempts)); // Exponential backoff
+    }
+  }
+  
+  return { success: false, error: 'Failed after all retries' };
+};
+
+const NetflixAdapter = (() => {
+  let cachedVideo = null;
+  let lastVideoCheck = 0;
+  const VIDEO_CACHE_TTL = 500; // Re-check video every 500ms max
+
+  // Ensure bridge is injected (async)
+  const ensureBridge = async () => {
+    const state = injectNetflixBridge.getState();
+    if (state !== 'ready') {
+      return await injectNetflixBridge.inject();
+    }
+    return true;
+  };
+
+  // Find the main video element (Netflix can have multiple/recreate them)
+  const findVideo = () => {
+    const now = Date.now();
+    if (cachedVideo && now - lastVideoCheck < VIDEO_CACHE_TTL) {
+      // Verify cached video is still valid
+      if (cachedVideo.isConnected && cachedVideo.readyState >= 1) {
+        return cachedVideo;
+      }
+    }
+    
+    lastVideoCheck = now;
+    
+    // Strategy 1: Main video with good readyState
+    let v = document.querySelector("video");
+    if (v && v.readyState >= 1 && v.duration > 0) {
+      cachedVideo = v;
+      return v;
+    }
+    
+    // Strategy 2: Netflix watch container
+    v = document.querySelector(".watch-video video");
+    if (v && v.readyState >= 1) {
+      cachedVideo = v;
+      return v;
+    }
+    
+    // Strategy 3: Any video with significant duration (not a preview)
+    const videos = document.querySelectorAll("video");
+    for (const vid of videos) {
+      if (vid.duration > 60 && vid.readyState >= 1) {
+        cachedVideo = vid;
+        return vid;
+      }
+    }
+    
+    // Fallback: first video
+    cachedVideo = videos[0] || null;
+    return cachedVideo;
+  };
+
+  // Get current playback state
+  const getState = () => {
+    const v = findVideo();
+    if (!v) return null;
+    return {
+      t: v.currentTime,
+      paused: v.paused,
+      duration: v.duration,
+      rate: v.playbackRate,
+      url: window.location.href,
+    };
+  };
+
+  // Seek using Netflix's internal API (preferred) or scrubber interaction (fallback)
+  const seekTo = async (time, maxAttempts = 3) => {
+    // Ensure bridge is ready before seeking
+    const bridgeReady = await ensureBridge();
+    if (!bridgeReady) {
+      console.warn("[NetflixAdapter] Bridge not ready, seek may fail");
+    }
+    
+    const v = findVideo();
+    if (!v || typeof time !== "number") return false;
+    
+    const currentTime = v.currentTime;
+    const diff = Math.abs(currentTime - time);
+    
+    // Already close enough (within 3 seconds)
+    if (diff < 3) {
+      console.log("[NetflixAdapter] Already at target time, skipping seek");
+      return true;
+    }
+    
+    console.log(`[NetflixAdapter] Seeking from ${currentTime.toFixed(1)} to ${time.toFixed(1)} (diff: ${diff.toFixed(1)}s)`);
+    
+    // Try Netflix's internal player API first (this respects DRM)
+    let seekSucceeded = false;
+    
+    for (let attempt = 1; attempt <= maxAttempts && !seekSucceeded; attempt++) {
+      try {
+        const result = await callNetflixAPI('seek', { timeMs: time * 1000 });
+        if (result.success) {
+          console.log(`[NetflixAdapter] Seek API call succeeded (attempt ${attempt})`);
+          
+          // Wait and verify the seek actually worked
+          await new Promise(r => setTimeout(r, 400));
+          
+          const newVideo = findVideo();
+          if (newVideo) {
+            const newDiff = Math.abs(newVideo.currentTime - time);
+            if (newDiff < 10) {
+              console.log(`[NetflixAdapter] Seek verified, now at ${newVideo.currentTime.toFixed(1)}s (diff: ${newDiff.toFixed(1)}s)`);
+              seekSucceeded = true;
+            } else {
+              console.log(`[NetflixAdapter] Seek not effective, still ${newDiff.toFixed(1)}s away (attempt ${attempt})`);
+            }
+          }
+        } else {
+          console.log(`[NetflixAdapter] Netflix API seek failed (attempt ${attempt}):`, result.error);
+          
+          // If multiple failures, try re-injecting the bridge (might be CSP issue)
+          if (attempt >= 2 && result.error?.includes('Timeout')) {
+            console.log('[NetflixAdapter] Multiple timeouts, forcing bridge re-injection...');
+            await injectNetflixBridge.forceReinject();
+          }
+        }
+      } catch (err) {
+        console.warn(`[NetflixAdapter] Netflix API seek error (attempt ${attempt}):`, err.message);
+      }
+      
+      // Wait before next attempt with exponential backoff
+      if (!seekSucceeded && attempt < maxAttempts) {
+        const delay = 300 * attempt;
+        await new Promise(r => setTimeout(r, delay));
+      }
+    }
+    
+    if (seekSucceeded) {
+      return true;
+    }
+    
+    // Fallback: Use scrubber interaction
+    console.log("[NetflixAdapter] Using scrubber fallback for seek");
+    const duration = v.duration || 0;
+    if (duration > 0) {
+      const scrubResult = await seekViaScrubberWithVerify(time, duration);
+      return scrubResult;
+    }
+    
+    return false;
+  };
+
+  // Seek by simulating click on Netflix's progress bar
+  const seekViaScrubber = (targetTime, duration) => {
+    try {
+      // First, show controls
+      showPlayerControls();
+      
+      // Wait a moment for controls to appear, then seek
+      setTimeout(() => {
+        // Find Netflix's scrubber/progress bar - try multiple selectors
+        const scrubber = document.querySelector('[data-uia="timeline-bar"]') ||
+                         document.querySelector('[data-uia="timeline"]') ||
+                         document.querySelector('.watch-video--advancement-container') ||
+                         document.querySelector('[class*="scrubber"]') ||
+                         document.querySelector('[class*="timeline"]');
+        
+        if (!scrubber) {
+          console.warn("[NetflixAdapter] Could not find scrubber element");
+          return false;
+        }
+        
+        performScrubberSeek(scrubber, targetTime, duration);
+      }, 300);
+      
+      return true;
+    } catch (err) {
+      console.warn("[NetflixAdapter] Scrubber seek failed:", err.message);
+      return false;
+    }
+  };
+
+  // Async version with verification
+  const seekViaScrubberWithVerify = async (targetTime, duration) => {
+    try {
+      // Show controls first
+      showPlayerControls();
+      
+      // Wait for controls to appear (increased delay)
+      await new Promise(r => setTimeout(r, 500));
+      
+      // Try multiple times with different selectors
+      const scrubberSelectors = [
+        '[data-uia="timeline-bar"]',
+        '[data-uia="timeline"]',
+        '.watch-video--advancement-container',
+        '[class*="scrubber"]',
+        '[class*="timeline"]',
+        '.PlayerControlsNeo__progress',
+        '.slider'
+      ];
+      
+      let scrubber = null;
+      for (const selector of scrubberSelectors) {
+        scrubber = document.querySelector(selector);
+        if (scrubber && scrubber.getBoundingClientRect().width > 50) {
+          console.log(`[NetflixAdapter] Found scrubber with selector: ${selector}`);
+          break;
+        }
+        scrubber = null;
+      }
+      
+      if (!scrubber) {
+        console.warn("[NetflixAdapter] Could not find usable scrubber element");
+        return false;
+      }
+      
+      performScrubberSeek(scrubber, targetTime, duration);
+      
+      // Wait and verify
+      await new Promise(r => setTimeout(r, 600));
+      
+      const v = findVideo();
+      if (v) {
+        const newDiff = Math.abs(v.currentTime - targetTime);
+        if (newDiff < 15) {
+          console.log(`[NetflixAdapter] Scrubber seek worked, now at ${v.currentTime.toFixed(1)}s`);
+          return true;
+        }
+        console.log(`[NetflixAdapter] Scrubber seek may not have worked, diff: ${newDiff.toFixed(1)}s`);
+      }
+      
+      return false;
+    } catch (err) {
+      console.warn("[NetflixAdapter] Scrubber seek failed:", err.message);
+      return false;
+    }
+  };
+
+  const performScrubberSeek = (scrubber, targetTime, duration) => {
+    const rect = scrubber.getBoundingClientRect();
+    const percentage = Math.max(0, Math.min(1, targetTime / duration));
+    const clickX = rect.left + (rect.width * percentage);
+    const clickY = rect.top + (rect.height / 2);
+    
+    console.log(`[NetflixAdapter] Clicking scrubber at ${(percentage * 100).toFixed(1)}% (x: ${clickX.toFixed(0)}, y: ${clickY.toFixed(0)})`);
+    
+    // Dispatch pointer events (more reliable than mouse events for modern Netflix)
+    const pointerDownEvent = new PointerEvent('pointerdown', {
+      bubbles: true,
+      cancelable: true,
+      clientX: clickX,
+      clientY: clickY,
+      pointerId: 1,
+      pointerType: 'mouse',
+      isPrimary: true
+    });
+    
+    const pointerUpEvent = new PointerEvent('pointerup', {
+      bubbles: true,
+      cancelable: true,
+      clientX: clickX,
+      clientY: clickY,
+      pointerId: 1,
+      pointerType: 'mouse',
+      isPrimary: true
+    });
+    
+    const clickEvent = new MouseEvent('click', {
+      bubbles: true,
+      cancelable: true,
+      clientX: clickX,
+      clientY: clickY,
+      button: 0,
+      view: window
+    });
+    
+    scrubber.dispatchEvent(pointerDownEvent);
+    scrubber.dispatchEvent(pointerUpEvent);
+    scrubber.dispatchEvent(clickEvent);
+    
+    return true;
+  };
+
+  // Show Netflix player controls by simulating mouse movement
+  const showPlayerControls = () => {
+    const watchContainer = document.querySelector('.watch-video') || 
+                           document.querySelector('[data-uia="video-canvas"]') ||
+                           document.querySelector('.VideoContainer');
+    
+    if (watchContainer) {
+      const rect = watchContainer.getBoundingClientRect();
+      
+      const mousemoveEvent = new MouseEvent('mousemove', {
+        bubbles: true,
+        cancelable: true,
+        clientX: rect.left + rect.width / 2,
+        clientY: rect.bottom - 100, // Near the bottom where controls appear
+        view: window
+      });
+      
+      watchContainer.dispatchEvent(mousemoveEvent);
+    }
+  };
+
+  // Set paused state using Netflix API or native controls
+  const setPaused = async (paused) => {
+    // Ensure bridge is ready
+    const bridgeReady = await ensureBridge();
+    if (!bridgeReady) {
+      console.warn("[NetflixAdapter] Bridge not ready for play/pause");
+    }
+    
+    const v = findVideo();
+    if (!v) return false;
+    
+    const needsPause = paused && !v.paused;
+    const needsPlay = !paused && v.paused;
+    
+    if (!needsPause && !needsPlay) {
+      return true; // Already in desired state
+    }
+    
+    // Try Netflix's internal API first
+    try {
+      const action = needsPause ? 'pause' : 'play';
+      const result = await callNetflixAPI(action);
+      if (result.success) {
+        console.log(`[NetflixAdapter] ${action} via Netflix API successful`);
+        return true;
+      }
+      console.log(`[NetflixAdapter] Netflix API ${action} failed:`, result.error);
+    } catch (err) {
+      console.warn("[NetflixAdapter] Netflix API play/pause error:", err.message);
+    }
+    
+    // Fallback to native video element
+    try {
+      if (needsPause) {
+        console.log("[NetflixAdapter] Pausing video (native fallback)");
+        v.pause();
+      } else if (needsPlay) {
+        console.log("[NetflixAdapter] Playing video (native fallback)");
+        await v.play().catch(e => {
+          console.log("[NetflixAdapter] Play failed (user gesture required):", e.message);
+        });
+      }
+      return true;
+    } catch (err) {
+      console.warn("[NetflixAdapter] Play/pause failed:", err.message);
+      return false;
+    }
+  };
+
+  // Check if video is ready for operations
+  const isReady = () => {
+    const v = findVideo();
+    return v && v.readyState >= 2 && v.duration > 0;
+  };
+
+  // Invalidate cache (call when video is known to have changed)
+  const invalidateCache = () => {
+    cachedVideo = null;
+    lastVideoCheck = 0;
+  };
+
+  // Wire event listeners to video element
+  const wireListeners = (handlers) => {
+    const v = findVideo();
+    if (!v) return null;
+    
+    const { onPlay, onPause, onSeeked, onTimeUpdate } = handlers;
+    
+    if (onPlay) v.addEventListener("play", onPlay, { passive: true });
+    if (onPause) v.addEventListener("pause", onPause, { passive: true });
+    if (onSeeked) v.addEventListener("seeked", onSeeked, { passive: true });
+    if (onTimeUpdate) v.addEventListener("timeupdate", onTimeUpdate, { passive: true });
+    
+    // Return unwire function
+    return () => {
+      if (onPlay) v.removeEventListener("play", onPlay);
+      if (onPause) v.removeEventListener("pause", onPause);
+      if (onSeeked) v.removeEventListener("seeked", onSeeked);
+      if (onTimeUpdate) v.removeEventListener("timeupdate", onTimeUpdate);
+    };
+  };
+
+  return {
+    findVideo,
+    getState,
+    seekTo,
+    setPaused,
+    isReady,
+    invalidateCache,
+    wireListeners,
+  };
+})();
+
+// ============================================================================
+// PlayerSync - Coordinates sync between room participants using NetflixAdapter
+// ============================================================================
 const PlayerSync = (() => {
   let video = null;
   let suppressNext = false;
   let observer = null;
-  let announced = false;
+  let isInRoom = false;
+  let eventsWired = false;
+  let syncRequestSent = false;
+  let lastDriftWarning = 0;
+  let pollInterval = null;
 
-  const attach = () => {
-    const candidate = document.querySelector("video");
-    if (!candidate || candidate === video) return;
-    video = candidate;
-    wirePlayer(video);
-    if (!announced) {
-      announced = true;
-      chrome.runtime.sendMessage({ type: "player-present" });
+  // Use adapter for video finding
+  const getVideo = () => NetflixAdapter.findVideo();
+
+  const setInRoom = (inRoom) => {
+    isInRoom = inRoom;
+    if (inRoom) {
+      // Only start observing when joining a room
+      startObservingIfNeeded();
+      attach();
+      // Reset sync request state
+      syncRequestSent = false;
+      // Start polling as backup
+      startPolling();
+    } else {
+      // Clean up when leaving room
+      video = null;
+      wiredVideoElement = null;
+      eventsWired = false;
+      syncRequestSent = false;
+      stopPolling();
+      // Disconnect observer
+      if (observer) {
+        observer.disconnect();
+        observer = null;
+      }
     }
+  };
+
+  let wiredVideoElement = null;  // Track which element has listeners
+
+  // Polling as fallback - MutationObserver can miss some cases
+  const startPolling = () => {
+    if (pollInterval) return;
+    pollInterval = setInterval(() => {
+      if (!isInRoom) return;
+      const v = getVideo();
+      if (v && v !== wiredVideoElement) {
+        console.log("[Flixers] Poll detected new video element");
+        attach();
+      }
+    }, 2000);  // Check every 2 seconds
+  };
+
+  const stopPolling = () => {
+    if (pollInterval) {
+      clearInterval(pollInterval);
+      pollInterval = null;
+    }
+  };
+
+  const startObservingIfNeeded = () => {
+    if (observer) return;
+    observer = new MutationObserver(() => {
+      if (!isInRoom) return;
+      const hasVideo = getVideo();
+      if (!hasVideo && video) {
+        video = null;
+        wiredVideoElement = null;
+        eventsWired = false;
+        syncRequestSent = false;
+        safeSend({ type: "player-present", present: false, playing: false, url: null });
+      }
+      if (hasVideo && hasVideo !== wiredVideoElement) {
+        attach();
+      }
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+  };
+  
+  const attach = () => {
+    if (!isInRoom) return;
+    const candidate = getVideo();
+    if (!candidate) return;
+    
+    video = candidate;
+    
+    // Re-wire if this is a different video element than before
+    if (wiredVideoElement !== video) {
+      console.log("[Flixers] Wiring video element listeners");
+      wirePlayer(video);
+      wiredVideoElement = video;
+      eventsWired = true;
+    }
+    
+    announcePlayer();
+    
+    // Request sync when video becomes ready (for joiners)
+    requestSyncIfNeeded();
+  };
+
+  const announcePlayer = () => {
+    if (!video) return;
+    safeSend({
+      type: "player-present",
+      present: true,
+      playing: !video.paused,
+      url: window.location.href,
+    });
+  };
+  
+  // Request sync state from other peers (for joiners)
+  const requestSyncIfNeeded = () => {
+    if (!isInRoom || !video || syncRequestSent) return;
+    
+    // Wait a moment for video to be ready before requesting sync
+    setTimeout(() => {
+      if (!isInRoom || !video || syncRequestSent) return;
+      
+      console.log("[Flixers] Video ready, requesting sync from peers");
+      syncRequestSent = true;
+      safeSend({ type: "request-sync" });
+    }, 1500);
+  };
+  
+  // Manual resync triggered by user
+  const requestResync = () => {
+    if (!isInRoom) return;
+    console.log("[Flixers] Manual resync requested");
+    syncRequestSent = false;
+    safeSend({ type: "request-sync" });
   };
 
   const wirePlayer = (el) => {
-    ["play", "pause", "seeking", "ratechange"].forEach((evt) => {
-      el.addEventListener(evt, handlePlayerEvent, { passive: true });
-    });
-    el.addEventListener("timeupdate", throttle(handleTimeUpdate, 250), {
-      passive: true,
-    });
+    // Track play/pause and seek events to sync with room
+    el.addEventListener("play", throttle(handlePlayEvent, 1000), { passive: true });
+    el.addEventListener("pause", throttle(handlePauseEvent, 1000), { passive: true });
+    el.addEventListener("seeked", throttle(handleSeekEvent, 2000), { passive: true });
+    // Periodic time updates for drift detection
+    el.addEventListener("timeupdate", throttle(handleTimeUpdate, 30000), { passive: true });
   };
 
-  const handlePlayerEvent = () => {
-    sendState("event");
+  const handlePlayEvent = () => {
+    if (!isInRoom || suppressNext) return;
+    console.log("[Flixers] Play event - broadcasting to room");
+    sendState("play");
   };
+
+  const handlePauseEvent = () => {
+    if (!isInRoom || suppressNext) return;
+    console.log("[Flixers] Pause event - broadcasting to room");
+    sendState("pause");
+  };
+
+  const handleSeekEvent = () => {
+    if (!isInRoom || suppressNext) return;
+    const state = NetflixAdapter.getState();
+    if (!state) return;
+    
+    const lastTime = handleSeekEvent._lastTime || 0;
+    const currentTime = state.t;
+    const diff = Math.abs(currentTime - lastTime);
+    handleSeekEvent._lastTime = currentTime;
+    
+    // Broadcast seeks of more than 3 seconds
+    if (diff > 3) {
+      console.log("[Flixers] Seek event:", diff.toFixed(1), "s - broadcasting to room");
+      sendState("seek");
+    }
+  };
+  handleSeekEvent._lastTime = 0;
 
   const handleTimeUpdate = () => {
-    sendState("time");
+    if (!isInRoom) return;
+    const state = NetflixAdapter.getState();
+    if (state) handleSeekEvent._lastTime = state.t;
   };
 
   const sendState = (reason) => {
-    if (!video || suppressNext) return;
-    chrome.runtime.sendMessage({
-      type: "player-event",
-      payload: serializeState(reason),
-    });
-  };
-
-  const serializeState = (reason) => ({
-    t: video.currentTime,
-    paused: video.paused,
-    rate: video.playbackRate,
-    reason,
-    ts: Date.now(),
-  });
-
-  const applyState = (payload) => {
-    if (!video) return;
-    suppressNext = true;
-    if (Math.abs(video.currentTime - payload.t) > 0.5) {
-      video.currentTime = payload.t;
-    }
-    if (payload.rate && video.playbackRate !== payload.rate) {
-      video.playbackRate = payload.rate;
-    }
-    if (payload.paused !== undefined) {
-      payload.paused ? video.pause() : video.play();
-    }
-    suppressNext = false;
-  };
-
-  const startObserving = () => {
-    observer = new MutationObserver(() => attach());
-    observer.observe(document.body, { childList: true, subtree: true });
-    attach();
-  };
-
-  return { start: startObserving, applyState };
-})();
-
-const Overlay = (() => {
-  let container;
-  let messagesEl;
-  let presenceEl;
-  let statusEl;
-  let roomLabelEl;
-  let inputEl;
-  let toggleBtn;
-  let pillEl;
-  let toastStack;
-  let roomInfo = { roomId: null, name: "Guest" };
-
-  const init = () => {
-    injectStyles();
-    container = document.createElement("div");
-    container.className = "flixers-overlay";
-    container.innerHTML = `
-      <div class="flixers-panel">
-        <div class="flixers-header">
-          <div>
-            <div class="flixers-title">Flixers</div>
-            <div class="flixers-room" id="flixers-room">Not joined</div>
-          </div>
-          <div class="flixers-pill flixers-pill--idle" id="flixers-connection">Idle</div>
-        </div>
-        <div class="flixers-meta">
-          <div class="flixers-presence-title">People</div>
-          <div class="flixers-chips" id="flixers-presence"></div>
-        </div>
-        <div class="flixers-status" id="flixers-status">Connection: idle</div>
-        <div class="flixers-messages" id="flixers-messages"></div>
-        <form class="flixers-input-row" id="flixers-form">
-          <input id="flixers-input" type="text" placeholder="Send a message" autocomplete="off" />
-          <button type="submit">Send</button>
-        </form>
-      </div>
-      <div class="flixers-toast-stack" id="flixers-toast-stack"></div>
-      <button class="flixers-toggle" aria-label="Toggle overlay">Flixers</button>
-    `;
-    document.body.appendChild(container);
-    messagesEl = container.querySelector("#flixers-messages");
-    presenceEl = container.querySelector("#flixers-presence");
-    statusEl = container.querySelector("#flixers-status") || null;
-    roomLabelEl = container.querySelector("#flixers-room");
-    inputEl = container.querySelector("#flixers-input");
-    toggleBtn = container.querySelector(".flixers-toggle");
-    pillEl = container.querySelector("#flixers-connection");
-    toastStack = container.querySelector("#flixers-toast-stack");
-
-    container.querySelector("form").addEventListener("submit", onSend);
-    toggleBtn.addEventListener("click", togglePanel);
-  };
-
-  const onSend = (e) => {
-    e.preventDefault();
-    const text = inputEl.value.trim();
-    if (!text || !roomInfo.roomId) return;
-    inputEl.value = "";
-    chrome.runtime.sendMessage({ type: "chat", text });
-    pushMessage(roomInfo.name || "You", text, Date.now());
-  };
-
-  const pushMessage = (from, text, ts) => {
-    const el = document.createElement("div");
-    el.className = "flixers-message";
-    const time = ts
-      ? new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-      : "";
-    el.innerHTML = `
-      <div class="flixers-message-meta">
-        <span class="flixers-from">${from}</span>
-        ${time ? `<span class="flixers-time">${time}</span>` : ""}
-      </div>
-      <div class="flixers-message-body">${escapeHtml(text || "")}</div>
-    `;
-    messagesEl.appendChild(el);
-    messagesEl.scrollTop = messagesEl.scrollHeight;
-  };
-
-  const setPresence = (users, roomId) => {
-    presenceEl.innerHTML = "";
-    if (!users || users.length === 0 || !roomId) {
-      presenceEl.innerHTML = `<span class="flixers-chip">No one online</span>`;
+    if (suppressNext || !isInRoom) return;
+    
+    const state = serializeState(reason);
+    if (!state) return;  // No video available
+    
+    // Debounce - 1 second between state updates
+    const now = Date.now();
+    if (sendState._lastSend && now - sendState._lastSend < 1000) {
       return;
     }
-    users.forEach((u) => {
-      const chip = document.createElement("span");
-      chip.className = "flixers-chip";
-      chip.textContent = u;
-      presenceEl.appendChild(chip);
+    sendState._lastSend = now;
+    
+    safeSend({
+      type: "player-event",
+      payload: state,
+    });
+  };
+  sendState._lastSend = 0;
+
+  const serializeState = (reason) => {
+    const state = NetflixAdapter.getState();
+    if (!state) return null;
+    return {
+      t: state.t,
+      paused: state.paused,
+      rate: state.rate,
+      reason,
+      ts: Date.now(),
+      url: state.url,
+    };
+  };
+
+  const applyState = async (payload, isRetry = false, retryContext = {}) => {
+    if (!payload) return;
+    
+    // Deduplicate: don't process the same sync request twice (unless it's a retry)
+    const payloadKey = `${payload.ts}-${payload.t}`;
+    if (!isRetry && applyState._lastPayloadKey === payloadKey) {
+      console.log("[Flixers] Duplicate sync request ignored");
+      return;
+    }
+    
+    console.log("[Flixers] applyState called with:", JSON.stringify(payload), isRetry ? "(retry)" : "");
+    
+    // Track retry context
+    const ctx = retryContext.retryCount !== undefined ? retryContext : { retryCount: 0, bridgeRetried: false };
+    
+    // Use adapter to check if video is ready
+    if (!NetflixAdapter.isReady()) {
+      // Retry after a short delay - Netflix might be recreating the player
+      if (ctx.retryCount < 10) { // 10 retries for video ready
+        ctx.retryCount++;
+        const delay = Math.min(400 * ctx.retryCount, 2500); // Exponential backoff
+        console.log(`[Flixers] Video not ready, retry ${ctx.retryCount}/10 in ${delay}ms`);
+        setTimeout(() => applyState(payload, true, ctx), delay);
+      } else {
+        console.log("[Flixers] Video never became ready after retries");
+        applyState._lastPayloadKey = payloadKey;
+      }
+      return;
+    }
+    
+    // Ensure bridge is ready before proceeding
+    const bridgeState = injectNetflixBridge.getState();
+    if (bridgeState !== 'ready' && !ctx.bridgeRetried) {
+      console.log("[Flixers] Bridge not ready, injecting before sync...");
+      ctx.bridgeRetried = true;
+      const bridgeInjected = await injectNetflixBridge.inject();
+      if (!bridgeInjected) {
+        console.warn("[Flixers] Bridge injection failed, will try scrubber fallback");
+      }
+    }
+    
+    // Update our local video reference
+    video = NetflixAdapter.findVideo();
+    
+    // Check if we're on the right video
+    if (payload?.url) {
+      const currentPath = window.location.pathname;
+      try {
+        const targetPath = new URL(payload.url).pathname;
+        if (currentPath !== targetPath) {
+          console.log("[Flixers] Different video, skipping sync");
+          return;
+        }
+      } catch (_) {
+        // URL parse error, continue anyway
+      }
+    }
+    
+    // ONLY sync on initial join (reason="sync") or manual resync
+    const isInitialSync = payload.reason === "sync";
+    console.log("[Flixers] isInitialSync:", isInitialSync, "reason:", payload.reason);
+    
+    if (!isInitialSync) {
+      // For ongoing updates, just log drift but don't try to control video
+      const state = NetflixAdapter.getState();
+      if (state && typeof payload.t === "number") {
+        const timeDiff = Math.abs(state.t - payload.t);
+        if (timeDiff > 10) {
+          const now = Date.now();
+          if (now - lastDriftWarning > 30000) {
+            lastDriftWarning = now;
+            console.log("[Flixers] Drift detected:", timeDiff.toFixed(1), "s - use Resync button");
+          }
+        }
+      }
+      return;
+    }
+    
+    // Debounce rapid sync requests (reduced from 500 to 300ms)
+    const now = Date.now();
+    if (!isRetry && applyState._lastApply && now - applyState._lastApply < 300) {
+      console.log("[Flixers] Debounced - too soon after last apply");
+      return;
+    }
+    applyState._lastApply = now;
+    
+    // Get current state for logging
+    const currentState = NetflixAdapter.getState();
+    const timeDiff = currentState && typeof payload.t === "number" 
+      ? Math.abs(currentState.t - payload.t) 
+      : 0;
+    
+    console.log("[Flixers] Sync - target:", payload.t?.toFixed(1), "current:", currentState?.t?.toFixed(1), "diff:", timeDiff.toFixed(1) + "s");
+    
+    // Skip if already close enough
+    if (timeDiff < 3) {
+      console.log("[Flixers] Already synced (within 3s), skipping seek");
+      applyState._lastPayloadKey = payloadKey;
+      // Still apply play/pause state
+      if (typeof payload.paused === "boolean") {
+        suppressNext = true;
+        try {
+          await NetflixAdapter.setPaused(payload.paused);
+        } catch (err) {
+          console.warn("[Flixers] Error setting paused state:", err.message);
+        }
+        setTimeout(() => { suppressNext = false; }, 500);
+      }
+      return;
+    }
+    
+    suppressNext = true;
+    
+    // Mark this payload as processed (before async operations)
+    applyState._lastPayloadKey = payloadKey;
+    
+    // Use adapter for all video operations (now async)
+    let seekSucceeded = false;
+    try {
+      if (typeof payload.t === "number") {
+        seekSucceeded = await NetflixAdapter.seekTo(payload.t);
+        console.log("[Flixers] Seek result:", seekSucceeded ? "success" : "may have failed");
+      }
+      
+      if (typeof payload.paused === "boolean") {
+        await NetflixAdapter.setPaused(payload.paused);
+      }
+    } catch (err) {
+      console.warn("[Flixers] Error applying state:", err.message);
+    }
+    
+    // Verify sync after a delay and retry if needed
+    if (!seekSucceeded && typeof payload.t === "number") {
+      setTimeout(async () => {
+        const state = NetflixAdapter.getState();
+        if (state) {
+          const newDiff = Math.abs(state.t - payload.t);
+          if (newDiff > 15) {
+            console.log(`[Flixers] Sync verification failed, still ${newDiff.toFixed(1)}s away. Try Resync button.`);
+          }
+        }
+      }, 1000);
+    }
+    
+    // Reset suppress flag after operations complete
+    setTimeout(() => { suppressNext = false; }, 800);
+  };
+  applyState._lastApply = 0;
+  applyState._lastPayloadKey = null;
+
+  const start = () => {
+    // Don't start observing automatically - wait until user joins a room
+    // This prevents triggering Netflix DRM when not needed
+  };
+
+  return { start, applyState, announcePlayer, setInRoom, requestResync };
+})();
+
+function Avatar({ name, avatarUrl }) {
+  const fallback = useMemo(() => assignAvatar(name), [name]);
+  if (avatarUrl) {
+    return html`<div
+      class="flixers-avatar flixers-avatar--image"
+      style=${{ backgroundImage: `url(${avatarUrl})` }}
+    ></div>`;
+  }
+  return html`<div
+    class="flixers-avatar"
+    style=${{ background: fallback.bg || "#222", color: "#fff" }}
+    aria-label=${`${name} avatar`}
+  >
+    ${fallback.emoji || fallback.initial}
+  </div>`;
+}
+
+function Message({ msg }) {
+  return html`<div class=${`flixers-message ${msg.pending ? "flixers-message--pending" : ""}`}>
+    <${Avatar} name=${msg.from} avatarUrl=${msg.avatar} />
+    <div class="flixers-message__body">
+      <div class="flixers-message__meta">
+        <span class="flixers-from">${msg.from}</span>
+        ${msg.pending
+          ? html`<span class="flixers-pending">queued</span>`
+          : msg.ts
+          ? html`<span class="flixers-time">
+              ${new Date(msg.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+            </span>`
+          : null}
+      </div>
+      <div
+        class="flixers-message__text"
+        dangerouslySetInnerHTML=${{ __html: escapeHtml(msg.text || "") }}
+      ></div>
+    </div>
+  </div>`;
+}
+
+function SystemMessage({ msg }) {
+  return html`<div class="flixers-system-message">
+    <span class="flixers-system-text">${msg.text}</span>
+    ${msg.ts
+      ? html`<span class="flixers-system-time">
+          ${new Date(msg.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+        </span>`
+      : null}
+  </div>`;
+}
+
+function PresenceList({ users, presenceAvatars }) {
+  if (!users?.length) {
+    return html`<div class="flixers-chip">No one online</div>`;
+  }
+  return users.map((u) =>
+    html`<div class="flixers-chip" key=${u}>
+      <${Avatar} name=${u} avatarUrl=${presenceAvatars.get(u)?.url} />
+      <span>${u}</span>
+    </div>`
+  );
+}
+
+function TypingIndicator({ typing }) {
+  const names = Object.keys(typing).filter((k) => typing[k]);
+  if (!names.length) return null;
+  const label = names.length === 1 ? `${names[0]} is typing…` : `${names.length} people are typing…`;
+  return html`<div class="flixers-typing">${label}</div>`;
+}
+
+// Apply or remove sidebar mode styles to Netflix's video container
+const applySidebarMode = (enabled) => {
+  const videoContainer = document.querySelector('.watch-video') || 
+                         document.querySelector('[data-uia="video-canvas"]') ||
+                         document.querySelector('.VideoContainer');
+  const isFullscreen = !!(document.fullscreenElement || document.webkitFullscreenElement);
+
+  // Only shift the video when in fullscreen to avoid hiding it in normal mode
+  const shouldApply = enabled && isFullscreen;
+
+  if (shouldApply) {
+    document.body.classList.add('flixers-sidebar-mode');
+  } else {
+    document.body.classList.remove('flixers-sidebar-mode');
+  }
+  
+  if (!videoContainer) return;
+  
+  if (shouldApply) {
+    videoContainer.classList.add('flixers-sidebar-active');
+  } else {
+    videoContainer.classList.remove('flixers-sidebar-active');
+  }
+};
+
+function App() {
+  const [room, setRoom] = useState({ roomId: null, name: "Guest" });
+  const [connection, setConnection] = useState("idle");
+  const [messages, setMessages] = useState([]);
+  const [participants, setParticipants] = useState([]);
+  const [typing, setTyping] = useState({});
+  const [session, setSession] = useState(null);
+  const [playerStatus, setPlayerStatus] = useState({ present: false, playing: false });
+  const [open, setOpen] = useState(true);
+  const [fullyHidden, setFullyHidden] = useState(false);
+  const [controlBarVisible, setControlBarVisible] = useState(true);
+  const [input, setInput] = useState("");
+  const presenceAvatars = useRef(new Map());
+  const lastTyping = useRef({});
+  const typingTimer = useRef(null);
+  const seenMessages = useRef(new Set());
+  const roomRef = useRef(room);
+  const messagesRef = useRef(null);
+  const controlBarHideTimer = useRef(null);
+  roomRef.current = room;
+
+  const scrollMessagesToBottom = (force) => {
+    const el = messagesRef.current;
+    if (!el) return;
+    if (force || el.scrollHeight - el.scrollTop - el.clientHeight < 48) {
+      el.scrollTop = el.scrollHeight;
+    }
+  };
+
+  useEffect(() => {
+    injectStyles();
+    // Don't start PlayerSync automatically - it will start when joining a room
+    // This prevents triggering Netflix's DRM protection
+    
+    // Announce player status periodically to ensure popup gets the status
+    const announceInterval = setInterval(() => {
+      if (!isContextValid()) return;
+      // Only announce if we have a video and are in a room
+      const video = document.querySelector("video");
+      if (video) {
+        safeSend({
+          type: "player-present",
+          present: true,
+          playing: !video.paused,
+          url: window.location.href,
+        });
+      }
+    }, 3000);
+    // Also periodically check room state in case messages were missed
+    const roomCheckInterval = setInterval(() => {
+      if (!isContextValid()) return;
+      safeSend({ type: "get-room" }, (res) => {
+        if (!res) return;
+        const currentRoom = roomRef.current;
+        if (res?.roomId && res.roomId !== currentRoom.roomId) {
+          setRoom({ roomId: res.roomId, name: res.name || "Guest" });
+        } else if (!res?.roomId && currentRoom.roomId) {
+          setRoom({ roomId: null, name: "Guest" });
+        }
+      });
+    }, 1500);
+    return () => {
+      clearInterval(announceInterval);
+      clearInterval(roomCheckInterval);
+    };
+  }, []);
+
+  // Apply sidebar mode to free video space whenever chat is open
+  useEffect(() => {
+    const isSidebar = open && room.roomId && !fullyHidden;
+    applySidebarMode(isSidebar);
+    
+    // Cleanup when component unmounts or mode changes
+    return () => {
+      applySidebarMode(false);
+    };
+  }, [open, room.roomId, fullyHidden]);
+
+  // Re-apply sidebar sizing when entering/exiting fullscreen
+  useEffect(() => {
+    const handleFsChange = () => {
+      const isSidebar = open && room.roomId && !fullyHidden;
+      applySidebarMode(isSidebar);
+      
+      // Scroll to bottom after fullscreen toggle (layout may have changed)
+      setTimeout(() => scrollMessagesToBottom(true), 100);
+      setTimeout(() => scrollMessagesToBottom(true), 300);
+    };
+    document.addEventListener("fullscreenchange", handleFsChange);
+    document.addEventListener("webkitfullscreenchange", handleFsChange);
+    return () => {
+      document.removeEventListener("fullscreenchange", handleFsChange);
+      document.removeEventListener("webkitfullscreenchange", handleFsChange);
+    };
+  }, [open, room.roomId, fullyHidden]);
+
+  // Auto-hide control bar after 3 seconds when chat is closed, show on mouse move
+  useEffect(() => {
+    // Only apply auto-hide when chat is closed and in a room
+    if (open || !room.roomId || fullyHidden) {
+      // Chat is open or not in room - always show control bar
+      setControlBarVisible(true);
+      if (controlBarHideTimer.current) {
+        clearTimeout(controlBarHideTimer.current);
+        controlBarHideTimer.current = null;
+      }
+      return;
+    }
+    
+    // Start hide timer
+    const startHideTimer = () => {
+      if (controlBarHideTimer.current) {
+        clearTimeout(controlBarHideTimer.current);
+      }
+      controlBarHideTimer.current = setTimeout(() => {
+        setControlBarVisible(false);
+      }, 3000);
+    };
+    
+    // Show control bar and reset timer on mouse move
+    const handleMouseMove = () => {
+      setControlBarVisible(true);
+      startHideTimer();
+    };
+    
+    // Initial timer start
+    setControlBarVisible(true);
+    startHideTimer();
+    
+    // Add mousemove listener
+    document.addEventListener("mousemove", handleMouseMove, { passive: true });
+    
+    return () => {
+      document.removeEventListener("mousemove", handleMouseMove);
+      if (controlBarHideTimer.current) {
+        clearTimeout(controlBarHideTimer.current);
+        controlBarHideTimer.current = null;
+      }
+    };
+  }, [open, room.roomId, fullyHidden]);
+
+  useEffect(() => {
+    const handler = (message) => {
+      if (!isContextValid()) return;
+      if (message.type === "apply-state") {
+        // Make sure PlayerSync is active and apply state (has its own retry logic)
+        PlayerSync.setInRoom(true);
+        PlayerSync.applyState(message.payload);
+      }
+      if (message.type === "chat") {
+        pushMessage({ from: message.from || "Anon", text: message.text || "", ts: message.ts, avatar: message.avatar });
+        // Force scroll to bottom when receiving a message
+        setTimeout(() => scrollMessagesToBottom(true), 50);
+      }
+      if (message.type === "system") {
+        pushMessage({ type: "system", text: message.text, ts: message.ts });
+        setTimeout(() => scrollMessagesToBottom(true), 50);
+      }
+      if (message.type === "presence") {
+        setParticipants(message.users || []);
+      }
+      if (message.type === "ws-status") {
+        setConnection(message.status || "idle");
+        // Scroll to bottom when connected/reconnected
+        if (message.status === "connected") {
+          setTimeout(() => scrollMessagesToBottom(true), 100);
+        }
+      }
+      if (message.type === "typing") {
+        const from = message.from || "Someone";
+        lastTyping.current[from] = Date.now();
+        setTyping((prev) => ({ ...prev, [from]: !!message.active }));
+      }
+      if (message.type === "player-present") {
+        setPlayerStatus({
+          present: !!message.present,
+          playing: !!message.playing,
+          url: message.url,
+        });
+      }
+      if (message.type === "room-update") {
+        setRoom({ roomId: message.roomId, name: message.name || "Guest" });
+        // Tell PlayerSync whether we're in a room
+        PlayerSync.setInRoom(!!message.roomId);
+        if (message.roomId) {
+          // Auto-open overlay when joining a room
+          setOpen(true);
+          // Scroll to bottom after messages load
+          setTimeout(() => scrollMessagesToBottom(true), 100);
+          // Note: Don't auto-trigger resync here - let the natural flow handle it
+          // The joiner's requestSyncIfNeeded() will trigger after video loads
+        } else {
+          resetChatState();
+        }
+      }
+      if (message.type === "auth") {
+        setSession(message.session || null);
+        if (!message.session) {
+          setRoom({ roomId: null, name: "Guest" });
+          resetChatState(true);
+        }
+      }
+    };
+    const removeListener = safeAddListener(handler);
+    // Fetch initial state from background
+    safeSend({ type: "get-room" }, (res) => {
+      if (res) setRoom({ roomId: res.roomId || null, name: res.name || "Guest" });
+    });
+    safeSend({ type: "get-presence" }, (res) => {
+      if (res?.users) setParticipants(res.users);
+    });
+    safeSend({ type: "get-connection-status" }, (res) => {
+      if (res?.status) setConnection(res.status);
+    });
+    safeSend({ type: "player-status" }, (res) => {
+      if (!res) return;
+      setPlayerStatus({ present: !!res.present, playing: !!res.playing, url: res.url });
+    });
+    safeSend({ type: "auth-get" }, (res) => {
+      setSession(res?.session || null);
+    });
+    return removeListener;
+  }, []);
+
+  useEffect(() => {
+    roomRef.current = room;
+  }, [room]);
+
+  useEffect(() => {
+    if (!room.roomId) {
+      resetChatState(true);
+      return;
+    }
+    loadMessagesForRoom(room.roomId);
+  }, [room.roomId]);
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      if (!isContextValid()) return;
+      const now = Date.now();
+      const copy = { ...typing };
+      let dirty = false;
+      Object.entries(lastTyping.current || {}).forEach(([name, ts]) => {
+        if (now - ts > 3500) {
+          delete copy[name];
+          delete lastTyping.current[name];
+          dirty = true;
+        }
+      });
+      if (dirty) setTyping(copy);
+    }, 800);
+    return () => clearInterval(interval);
+  }, []);
+
+  const pushMessage = (msg) => {
+    const key = `${msg.from || "anon"}-${msg.ts || Date.now()}-${msg.text || ""}`;
+    if (seenMessages.current.has(key)) return;
+    seenMessages.current.add(key);
+    setMessages((prev) => {
+      const next = [...prev, msg].slice(-200);
+      persistMessages(next);
+      return next;
     });
   };
 
-  const setStatus = (text) => {
-    if (statusEl) statusEl.textContent = text;
+  const resetChatState = (clearStore = false) => {
+    const roomId = roomRef.current?.roomId;
+    if (clearStore && roomId && chrome?.storage?.local) {
+      const key = storageKey(roomId);
+      try {
+        chrome.storage.local.remove(key, () => {});
+      } catch (_) {
+        // ignore
+      }
+    }
+    setMessages([]);
+    seenMessages.current.clear();
+    setTyping({});
+    lastTyping.current = {};
+    scrollMessagesToBottom(true);
   };
 
-  const setRoom = (roomId, name) => {
-    roomInfo = { roomId, name: name || "Guest" };
-    roomLabelEl.textContent = roomId
-      ? `Room ${roomId} — ${roomInfo.name}`
-      : "Not joined";
-    if (!roomId) {
-      setPresence([], null);
+  const activeTyping = useMemo(
+    () => Object.fromEntries(Object.entries(typing).filter(([, v]) => v)),
+    [typing]
+  );
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    const text = encodeEmojis(input.trim());
+    if (!text || !room.roomId) return;
+    
+    const isQueued = connection !== "connected";
+    safeSend({ type: "chat", text });
+    pushMessage({
+      from: session?.profile?.name || "You",
+      text,
+      ts: Date.now(),
+      avatar: session?.profile?.picture || null,
+      pending: isQueued, // Mark as pending if queued
+    });
+    setInput("");
+    signalTyping(false);
+    // Force scroll to bottom when sending a message
+    setTimeout(() => scrollMessagesToBottom(true), 50);
+  };
+
+  const handleClear = () => {
+    resetChatState();
+  };
+
+  const signalTyping = (active) => {
+    if (!isContextValid()) return;
+    safeSend({ type: "typing", active });
+  };
+
+  const handleInput = (val) => {
+    setInput(val);
+    if (typingTimer.current) clearTimeout(typingTimer.current);
+    signalTyping(!!val.trim());
+    typingTimer.current = setTimeout(() => signalTyping(false), 1800);
+  };
+
+  // Stop keyboard events from propagating to Netflix player
+  const stopKeyboardPropagation = (e) => {
+    e.stopPropagation();
+    // Also stop immediate propagation to prevent Netflix's event listeners
+    if (e.nativeEvent) {
+      e.nativeEvent.stopImmediatePropagation();
     }
   };
 
-  const setConnection = (status) => {
-    const ok = status === "connected";
-    const cls = ok ? "flixers-pill--ok" : status === "connecting" ? "flixers-pill--warm" : "flixers-pill--bad";
-    pillEl.textContent = status;
-    pillEl.className = `flixers-pill ${cls}`;
-  };
-
-  const togglePanel = () => {
-    container.classList.toggle("flixers-hidden");
-  };
-
-  const showToast = (text, variant = "info") => {
-    const toast = document.createElement("div");
-    toast.className = `flixers-toast flixers-toast--${variant}`;
-    toast.textContent = text;
-    toastStack.appendChild(toast);
-    requestAnimationFrame(() => toast.classList.add("show"));
-    setTimeout(() => {
-      toast.classList.remove("show");
-      setTimeout(() => toast.remove(), 180);
-    }, 2600);
-  };
-
-  const injectStyles = () => {
-    if (document.getElementById("flixers-styles")) return;
-    const style = document.createElement("style");
-    style.id = "flixers-styles";
-    style.textContent = `
-      .flixers-overlay { position: fixed; bottom: 24px; right: 24px; z-index: 999999; font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #f8fafc; }
-      .flixers-panel { width: 300px; background: rgba(10, 12, 20, 0.9); border: 1px solid rgba(255,255,255,0.06); border-radius: 14px; box-shadow: 0 18px 48px rgba(0,0,0,0.4); padding: 14px; backdrop-filter: blur(12px); }
-      .flixers-header { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
-      .flixers-title { font-weight: 700; letter-spacing: 0.5px; font-size: 15px; }
-      .flixers-room { font-size: 12px; color: #cbd5e1; }
-      .flixers-pill { padding: 6px 12px; border-radius: 999px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; border: 1px solid rgba(255,255,255,0.08); }
-      .flixers-pill--idle { background: #161d2e; color: #9aa5c4; }
-      .flixers-pill--ok { background: rgba(110, 242, 196, 0.2); border-color: #6ef2c4; color: #6ef2c4; }
-      .flixers-pill--bad { background: rgba(255, 111, 97, 0.15); border-color: #ff6f61; color: #ff6f61; }
-      .flixers-pill--warm { background: rgba(255, 178, 122, 0.14); border-color: #ffb27a; color: #ffb27a; }
-      .flixers-meta { margin: 10px 0 6px; }
-      .flixers-presence-title { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: #9aa5c4; margin-bottom: 6px; }
-      .flixers-chips { display: flex; flex-wrap: wrap; gap: 6px; }
-      .flixers-chip { padding: 6px 10px; border-radius: 999px; border: 1px solid rgba(255,255,255,0.08); background: rgba(255,255,255,0.04); font-size: 12px; color: #f8fafc; }
-      .flixers-status { font-size: 11px; color: #cbd5e1; margin: 6px 0 10px; letter-spacing: 0.01em; }
-      .flixers-messages { height: 180px; overflow-y: auto; border: 1px solid rgba(255,255,255,0.06); border-radius: 10px; padding: 10px; background: rgba(6,10,20,0.6); font-size: 12px; display: flex; flex-direction: column; gap: 8px; }
-      .flixers-message { padding: 8px 10px; border-radius: 10px; border: 1px solid rgba(255,255,255,0.06); background: rgba(255,255,255,0.03); box-shadow: 0 8px 24px rgba(0,0,0,0.32); }
-      .flixers-message-meta { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; color: #a5b4fc; font-size: 11px; }
-      .flixers-from { font-weight: 700; color: #ffb86c; }
-      .flixers-time { color: #94a3b8; }
-      .flixers-message-body { color: #f8fafc; line-height: 1.4; }
-      .flixers-input-row { display: grid; grid-template-columns: 1fr 70px; gap: 8px; margin-top: 10px; }
-      .flixers-input-row input { border-radius: 10px; border: 1px solid rgba(255,255,255,0.14); background: rgba(255,255,255,0.06); color: #f8fafc; padding: 10px; }
-      .flixers-input-row button { border: none; border-radius: 10px; background: linear-gradient(135deg, #ff6f61, #ffb27a); color: #0f1117; font-weight: 700; cursor: pointer; }
-      .flixers-toggle { margin-top: 10px; width: 100%; background: rgba(255,255,255,0.08); color: #f8fafc; border: 1px solid rgba(255,255,255,0.12); border-radius: 10px; padding: 8px; cursor: pointer; }
-      .flixers-hidden .flixers-panel { display: none; }
-      .flixers-toast-stack { position: absolute; bottom: -8px; right: 0; display: flex; flex-direction: column; gap: 8px; pointer-events: none; }
-      .flixers-toast { min-width: 200px; background: rgba(10,12,20,0.95); border: 1px solid rgba(255,255,255,0.1); color: #f8fafc; padding: 10px 12px; border-radius: 10px; box-shadow: 0 10px 30px rgba(0,0,0,0.35); opacity: 0; transform: translateY(6px); transition: opacity 0.2s ease, transform 0.2s ease; }
-      .flixers-toast.show { opacity: 1; transform: translateY(0); }
-      .flixers-toast--info { border-color: #6ef2c4; }
-      .flixers-toast--warn { border-color: #ff6f61; }
-    `;
-    document.head.appendChild(style);
-  };
-
-  return {
-    init,
-    pushMessage,
-    setPresence,
-    setStatus,
-    setRoom,
-    setConnection,
-    showToast,
-    getName: () => roomInfo.name || "Guest",
-  };
-})();
-
-PlayerSync.start();
-Overlay.init();
-
-chrome.runtime.onMessage.addListener((message) => {
-  if (message.type === "apply-state") {
-    PlayerSync.applyState(message.payload);
-  }
-  if (message.type === "chat") {
-    Overlay.pushMessage(message.from || "Anon", message.text || "", message.ts);
-    if ((message.from || "").toLowerCase() !== (Overlay.getName() || "").toLowerCase()) {
-      Overlay.showToast(`${message.from || "Someone"} sent a message`, "info");
+  const persistMessages = (msgs) => {
+    const roomId = roomRef.current?.roomId;
+    if (!roomId || !msgs || !isContextValid()) return;
+    const key = storageKey(roomId);
+    try {
+      chrome.storage?.local?.set({ [key]: msgs.slice(-200) }, () => {
+        if (chrome.runtime?.lastError) {
+          extensionContextValid = false;
+        }
+      });
+    } catch (_) {
+      extensionContextValid = false;
     }
+  };
+
+  const loadMessagesForRoom = (roomId) => {
+    if (!roomId || !isContextValid()) return;
+    const key = storageKey(roomId);
+    try {
+      chrome.storage?.local?.get([key], (res) => {
+        if (chrome.runtime?.lastError) {
+          extensionContextValid = false;
+          return;
+        }
+        const list = Array.isArray(res[key]) ? res[key] : [];
+        seenMessages.current = new Set(
+          list.map((m) => `${m.from || "anon"}-${m.ts || ""}-${m.text || ""}`)
+        );
+        setMessages(list.slice(-200));
+        scrollMessagesToBottom(true);
+      });
+    } catch (_) {
+      extensionContextValid = false;
+    }
+  };
+
+  const connectionPill = useMemo(() => {
+    if (connection === "connected") return "flixers-pill--ok";
+    if (connection === "connecting" || connection === "reconnecting") return "flixers-pill--warm";
+    return "flixers-pill--bad";
+  }, [connection]);
+
+  const presenceAvatarsMemo = useMemo(() => {
+    const map = presenceAvatars.current;
+    participants.forEach((p) => {
+      if (!map.has(p)) {
+        map.set(p, { url: null });
+      }
+      if (session?.profile?.picture && session?.profile?.name === p) {
+        map.set(p, { url: session.profile.picture });
+      }
+    });
+    return map;
+  }, [participants, session]);
+
+  useEffect(() => {
+    scrollMessagesToBottom();
+  }, [messages]);
+
+  const isWatchPage = window.location.pathname.includes("/watch/");
+  if (!session || !room.roomId || !isWatchPage) {
+    return null;
   }
-  if (message.type === "presence") {
-    Overlay.setPresence(message.users || [], message.roomId);
-  }
-  if (message.type === "ws-status") {
-    Overlay.setStatus(`Connection: ${message.status}`);
-    Overlay.setConnection(message.status);
-    if (message.status !== "connected") {
-      Overlay.showToast("Reconnecting…", "warn");
+
+  // When chat is open, show the panel. When closed, hide panel but keep control bar visible
+  const overlayClasses = `flixers-overlay ${open ? "" : "flixers-hidden"} flixers-sidebar`;
+
+  // Control bar - single chat toggle button on the right side
+  // Position changes based on whether chat panel is open
+  // Auto-hides after 3 seconds when chat is closed, reappears on mouse move
+  const controlBarClasses = `flixers-control-bar ${open ? "" : "flixers-control-bar--collapsed"} ${!controlBarVisible && !open ? "flixers-control-bar--autohidden" : ""}`;
+  
+  const controlBar = fullyHidden
+    ? null
+    : html`<div class=${controlBarClasses}>
+        <button 
+          class="flixers-control-btn flixers-control-btn--chat"
+          aria-label=${open ? "Hide chat" : "Show chat"}
+          onClick=${() => setOpen(!open)}
+          title=${open ? "Hide chat" : "Show chat"}
+        >
+          <span class="flixers-control-icon">${open ? "✕" : "💬"}</span>
+          ${!open && messages.length > 0 ? html`<span class="flixers-control-badge"></span>` : null}
+        </button>
+      </div>`;
+
+  const overlay = fullyHidden
+    ? null
+    : html`<div 
+        class=${overlayClasses}
+        onKeyDown=${stopKeyboardPropagation}
+        onKeyUp=${stopKeyboardPropagation}
+        onKeyPress=${stopKeyboardPropagation}
+      >
+        <div class="flixers-panel">
+          <div class="flixers-header">
+            <div>
+              <div class="flixers-title">Live Chat</div>
+              <div class="flixers-room">
+                ${room.roomId ? `Room ${room.roomId}` : "Not joined"}
+              </div>
+            </div>
+            <div class="flixers-header-right">
+              <div class=${`flixers-pill ${connectionPill}`} id="flixers-connection">
+                ${connection}
+              </div>
+            </div>
+          </div>
+          <div class="flixers-meta">
+            <div class="flixers-presence-title">
+              People · ${participants.length}
+            </div>
+            <div class="flixers-chips">
+              <${PresenceList} users=${participants} presenceAvatars=${presenceAvatarsMemo} />
+            </div>
+          </div>
+          <div class="flixers-status">
+            ${room.roomId
+              ? connection === "connected"
+                ? "Connected and ready to chat"
+                : connection === "connecting"
+                ? "Connecting to room..."
+                : connection === "reconnecting"
+                ? "Reconnecting to room..."
+                : "Disconnected - trying to reconnect..."
+              : "Join a room from the popup to start chatting"}
+          </div>
+          <div class="flixers-messages-header">
+            <span>Messages</span>
+            <div class="flixers-header-actions">
+              <button type="button" class="flixers-clear" onClick=${handleClear}>Clear</button>
+            </div>
+          </div>
+          <div class="flixers-messages" ref=${messagesRef}>
+            ${messages.map((m, idx) =>
+              m.type === "system"
+                ? html`<${SystemMessage} msg=${m} key=${`sys-${m.ts || idx}-${idx}`} />`
+                : html`<${Message} msg=${m} key=${`${m.ts || idx}-${idx}`} />`
+            )}
+          </div>
+          <${TypingIndicator} typing=${activeTyping} />
+          <form class="flixers-input-row" onSubmit=${handleSubmit}>
+            <input
+              type="text"
+              placeholder=${connection === "connected" ? "Send a message" : "Message will be sent when connected..."}
+              value=${input}
+              onInput=${(e) => handleInput(e.target.value)}
+              onKeyDown=${stopKeyboardPropagation}
+              onKeyUp=${stopKeyboardPropagation}
+              onKeyPress=${stopKeyboardPropagation}
+              disabled=${!room.roomId}
+            />
+            <button type="submit" disabled=${!room.roomId || !input.trim()}>${connection === "connected" ? "Send" : "Queue"}</button>
+          </form>
+        </div>
+      </div>`;
+
+  return html`
+    ${controlBar}
+    ${overlay}
+    <button
+      class=${`flixers-reopen ${fullyHidden ? "" : "flixers-reopen--hidden"}`}
+      aria-label="Show Flixers"
+      onClick=${() => { setFullyHidden(false); setOpen(true); }}
+    >
+      💬 Flixers
+    </button>
+  `;
+}
+
+const root = document.createElement("div");
+root.id = "flixers-react-root";
+
+// Block keyboard events from propagating to Netflix when Flixers elements are focused
+const setupKeyboardBlocker = () => {
+  const flixersRoot = document.getElementById("flixers-react-root");
+  if (!flixersRoot) return;
+  
+  // Keys that Netflix listens to - we need to block these
+  const blockedKeys = new Set([
+    " ", "Space", "Spacebar",  // Play/pause
+    "ArrowLeft", "ArrowRight", // Seek
+    "ArrowUp", "ArrowDown",   // Volume
+    "f", "F",                 // Fullscreen
+    "m", "M",                 // Mute
+    "Escape",                 // Exit fullscreen
+    "Enter",                  // Various actions
+  ]);
+  
+  const blockKeyboardEvent = (e) => {
+    // Check if the event target is inside Flixers
+    const isFlixersElement = flixersRoot.contains(e.target) || e.target === flixersRoot;
+    
+    if (isFlixersElement) {
+      // Stop propagation for all keys when focused on Flixers
+      e.stopPropagation();
+      e.stopImmediatePropagation();
+      
+      // For special keys that Netflix might capture at document level, prevent default too
+      // but only if not in an input (so user can still type spaces, etc.)
+      const isInput = e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA";
+      if (!isInput && blockedKeys.has(e.key)) {
+        e.preventDefault();
+      }
+    }
+  };
+  
+  // Use capture phase to intercept events before Netflix
+  document.addEventListener("keydown", blockKeyboardEvent, true);
+  document.addEventListener("keyup", blockKeyboardEvent, true);
+  document.addEventListener("keypress", blockKeyboardEvent, true);
+  
+  console.log("[Flixers] Keyboard blocker installed");
+};
+
+// Handle fullscreen changes to keep overlay visible
+const setupFullscreenHandler = () => {
+  const enforceZIndex = () => {
+    const overlayRoot = document.getElementById("flixers-react-root");
+    if (!overlayRoot) return;
+    overlayRoot.style.setProperty("z-index", "9999999999", "important");
+    overlayRoot.style.setProperty("position", "fixed", "important");
+    overlayRoot.style.setProperty("pointer-events", "none", "important");
+    overlayRoot.style.setProperty("inset", "0", "important");
+
+    const overlay = overlayRoot.querySelector(".flixers-overlay");
+    if (overlay) {
+      overlay.style.setProperty("z-index", "9999999999", "important");
+      overlay.style.setProperty("position", "fixed", "important");
+      overlay.style.setProperty("pointer-events", "auto", "important");
+    }
+
+    const reopen = overlayRoot.querySelector(".flixers-reopen");
+    if (reopen) {
+      reopen.style.setProperty("z-index", "9999999999", "important");
+      reopen.style.setProperty("position", "fixed", "important");
+      reopen.style.setProperty("pointer-events", "auto", "important");
+    }
+
+    // IMPORTANT: Control bar needs pointer-events in fullscreen
+    const controlBar = overlayRoot.querySelector(".flixers-control-bar");
+    if (controlBar) {
+      controlBar.style.setProperty("z-index", "9999999999", "important");
+      controlBar.style.setProperty("position", "fixed", "important");
+      controlBar.style.setProperty("pointer-events", "auto", "important");
+    }
+
+    // Also enforce on all buttons inside control bar
+    const controlBtns = overlayRoot.querySelectorAll(".flixers-control-btn");
+    controlBtns.forEach(btn => {
+      btn.style.setProperty("pointer-events", "auto", "important");
+      btn.style.setProperty("cursor", "pointer", "important");
+    });
+  };
+
+  const moveOverlayToFullscreenContext = () => {
+    const overlay = document.getElementById("flixers-react-root");
+    if (!overlay) return;
+    
+    // Check if we're in fullscreen
+    const fullscreenElement = document.fullscreenElement || 
+                              document.webkitFullscreenElement || 
+                              document.mozFullScreenElement ||
+                              document.msFullscreenElement;
+    
+    if (fullscreenElement) {
+      // We're in fullscreen - move overlay DIRECTLY into the fullscreen element
+      // This is crucial for pointer-events to work
+      
+      // Only move if not already inside the fullscreen element
+      if (!fullscreenElement.contains(overlay)) {
+        console.log("[Flixers] Moving overlay into fullscreen context:", fullscreenElement.tagName);
+        // Append directly to fullscreen element for best compatibility
+        fullscreenElement.appendChild(overlay);
+      }
+      
+      // Force styles immediately after move
+      enforceZIndex();
+      
+      // Double-check styles after a short delay (Netflix can override)
+      setTimeout(enforceZIndex, 100);
+      setTimeout(enforceZIndex, 300);
     } else {
-      Overlay.showToast("Connected", "info");
+      // Not in fullscreen - move overlay back to body if needed
+      if (overlay.parentElement !== document.body) {
+        console.log("[Flixers] Moving overlay back to document body");
+        document.body.appendChild(overlay);
+      }
+      enforceZIndex();
     }
+  };
+  
+  // Listen for fullscreen changes
+  document.addEventListener('fullscreenchange', moveOverlayToFullscreenContext);
+  document.addEventListener('webkitfullscreenchange', moveOverlayToFullscreenContext);
+  document.addEventListener('mozfullscreenchange', moveOverlayToFullscreenContext);
+  document.addEventListener('MSFullscreenChange', moveOverlayToFullscreenContext);
+  
+  // Also check periodically in case we missed an event (Netflix can be tricky)
+  // Check more frequently (500ms) to ensure fullscreen interaction works
+  setInterval(() => {
+    const fullscreenElement = document.fullscreenElement || 
+                              document.webkitFullscreenElement;
+    const overlay = document.getElementById("flixers-react-root");
+    if (!overlay) return;
+    
+    if (fullscreenElement && !fullscreenElement.contains(overlay)) {
+      moveOverlayToFullscreenContext();
+    } else if (!fullscreenElement && overlay.parentElement !== document.body) {
+      moveOverlayToFullscreenContext();
+    }
+    
+    // Always enforce z-index and pointer-events in fullscreen
+    if (fullscreenElement) {
+      enforceZIndex();
+    }
+  }, 500);
+
+  // Initial enforce on setup
+  enforceZIndex();
+};
+
+const mount = () => {
+  if (!h || !render || !html) return;
+  if (document.getElementById("flixers-react-root")) return;
+  document.body.appendChild(root);
+  render(html`<${App} />`, root);
+  // Setup fullscreen handler after mounting
+  setupFullscreenHandler();
+  // Setup keyboard blocker to prevent Netflix from capturing keystrokes
+  setupKeyboardBlocker();
+};
+
+function waitForDepsAndMount(attempts = 0) {
+  loadGlobals();
+  if (h && render && html) {
+    mount();
+    return;
   }
-});
+  if (attempts > 200) return;
+  setTimeout(() => waitForDepsAndMount(attempts + 1), 75);
+}
 
-chrome.runtime.sendMessage({ type: "get-room" }, (res) => {
-  Overlay.setRoom(res?.roomId || null, res?.name || "Guest");
-});
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", () => waitForDepsAndMount());
+} else {
+  waitForDepsAndMount();
+}
 
-// Simple throttle to limit chatter back to the background script.
+function assignAvatar(name) {
+  if (!name) return { emoji: "👤", bg: "#2f3545", initial: "?" };
+  const idx = Math.abs(hashCode(name)) % BUILTIN_AVATARS.length;
+  const base = BUILTIN_AVATARS[idx];
+  return { ...base, initial: (name[0] || "?").toUpperCase() };
+}
+
+function encodeEmojis(text) {
+  const table = [
+    [/:\)/g, "😊"],
+    [/:\(/g, "🙁"],
+    [/:D/gi, "😃"],
+    [/;\)/g, "😉"],
+    [/:P/gi, "😛"],
+    [/<3/g, "❤️"],
+  ];
+  return table.reduce((acc, [pattern, emoji]) => acc.replace(pattern, emoji), text);
+}
+
+function injectStyles() {
+  if (document.getElementById("flixers-styles-react")) return;
+  const style = document.createElement("style");
+  style.id = "flixers-styles-react";
+  style.textContent = `
+    /* Base overlay styles */
+    :root { --flixers-sidebar-width: 380px; --flixers-sidebar-gutter: 18px; --flixers-z-max: 2147483647; }
+    .flixers-overlay { position: fixed; top: 18px; right: var(--flixers-sidebar-gutter); bottom: 18px; z-index: var(--flixers-z-max) !important; width: var(--flixers-sidebar-width); max-height: calc(100vh - 36px); font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #e5edff; transition: transform 0.3s ease, opacity 0.3s ease; box-sizing: border-box; display: flex; flex-direction: column; gap: 10px; pointer-events: auto; font-size: 14px; line-height: 1.5; }
+    #flixers-react-root { z-index: var(--flixers-z-max) !important; position: relative; }
+    .flixers-overlay .flixers-panel,
+    .flixers-overlay .flixers-toggle { pointer-events: auto; }
+    .flixers-overlay .flixers-panel { flex: 1; max-height: 100%; display: flex; flex-direction: column; }
+    .flixers-overlay .flixers-messages { flex: 1; min-height: 150px; max-height: none; }
+    .flixers-overlay .flixers-input-row { flex-shrink: 0; }
+    .flixers-hidden { transform: translateX(calc(var(--flixers-sidebar-width) + 50px)); opacity: 0; pointer-events: none; }
+    .flixers-hidden .flixers-panel { pointer-events: none; }
+    .flixers-panel { background: linear-gradient(180deg, #0d1323 0%, #0a0f1a 100%); border: 1px solid rgba(255,255,255,0.08); border-radius: 16px; box-shadow: 0 18px 48px rgba(0,0,0,0.45); padding: 14px; backdrop-filter: blur(12px); box-sizing: border-box; }
+    .flixers-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; margin-bottom: 6px; }
+    .flixers-header-right { display: flex; align-items: center; gap: 8px; }
+    .flixers-title { font-weight: 800; letter-spacing: 0.4px; font-size: 16px; text-transform: uppercase; color: #c7d3ff; }
+    .flixers-room { font-size: 13px; color: #94a3b8; }
+    .flixers-pill { padding: 6px 12px; border-radius: 999px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; border: 1px solid rgba(255,255,255,0.08); }
+    .flixers-pill--ok { background: rgba(110, 242, 196, 0.2); border-color: #6ef2c4; color: #6ef2c4; }
+    .flixers-pill--bad { background: rgba(255, 111, 97, 0.15); border-color: #ff6f61; color: #ff6f61; }
+    .flixers-pill--warm { background: rgba(255, 178, 122, 0.14); border-color: #ffb27a; color: #ffb27a; }
+    .flixers-meta { margin: 12px 0 8px; }
+    .flixers-presence-title { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: #9aa5c4; margin-bottom: 6px; }
+    .flixers-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+    .flixers-chip { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; border-radius: 999px; border: 1px solid rgba(255,255,255,0.08); background: rgba(255,255,255,0.04); font-size: 13px; color: #f8fafc; }
+    .flixers-status { font-size: 12px; color: #cbd5e1; margin: 6px 0 10px; letter-spacing: 0.01em; }
+    .flixers-messages-header { display: flex; align-items: center; justify-content: space-between; color: #c7d3ff; font-size: 13px; margin: 4px 0 6px; }
+    .flixers-header-actions { display: flex; gap: 6px; }
+    .flixers-resync { background: rgba(110, 242, 196, 0.15); border: 1px solid rgba(110, 242, 196, 0.3); color: #6ef2c4; padding: 7px 12px; border-radius: 12px; cursor: pointer; font-size: 12px; font-weight: 700; }
+    .flixers-resync:hover { background: rgba(110, 242, 196, 0.25); }
+    .flixers-clear { background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1); color: #e5edff; padding: 7px 12px; border-radius: 12px; cursor: pointer; font-size: 12px; font-weight: 600; }
+    .flixers-messages { height: 240px; overflow-y: auto; border: 1px solid rgba(255,255,255,0.06); border-radius: 12px; padding: 12px; background: rgba(6,10,20,0.7); font-size: 13px; display: flex; flex-direction: column; gap: 10px; }
+    .flixers-message { display: grid; grid-template-columns: 38px 1fr; gap: 8px; padding: 8px 10px; border-radius: 12px; border: 1px solid rgba(255,255,255,0.06); background: rgba(18,22,35,0.9); box-shadow: 0 8px 24px rgba(0,0,0,0.32); }
+    .flixers-avatar { width: 34px; height: 34px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; font-size: 16px; font-weight: 700; background-size: cover; background-position: center; }
+    .flixers-avatar--image { background-size: cover; background-position: center; }
+    .flixers-message__meta { display: flex; align-items: center; gap: 6px; margin-bottom: 2px; color: #a5b4fc; font-size: 12px; }
+    .flixers-from { font-weight: 700; color: #ffb86c; }
+    .flixers-time { color: #94a3b8; }
+    .flixers-pending { color: #ffb27a; font-size: 11px; font-style: italic; }
+    .flixers-message--pending { opacity: 0.7; border-style: dashed; }
+    .flixers-message__text { color: #f8fafc; line-height: 1.5; word-break: break-word; }
+    .flixers-input-row { display: grid; grid-template-columns: 1fr 96px; gap: 10px; margin-top: 12px; }
+    .flixers-input-row input { border-radius: 12px; border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.06); color: #f8fafc; padding: 13px; font-size: 14px; }
+    .flixers-input-row button { border: none; border-radius: 12px; background: linear-gradient(135deg, #ff6f61, #ffb27a); color: #0f1117; font-weight: 800; cursor: pointer; box-shadow: 0 12px 28px rgba(255, 179, 122, 0.35); font-size: 14px; }
+    .flixers-toggle-row { display: flex; gap: 10px; margin-bottom: 12px; justify-content: flex-end; align-items: center; }
+    .flixers-toggle-row--top { position: sticky; top: 0; z-index: 2; }
+    .flixers-toggle { flex: 0 0 auto; background: rgba(255,255,255,0.12); color: #f8fafc; border: 1px solid rgba(255,255,255,0.18); border-radius: 12px; padding: 10px 12px; cursor: pointer; font-weight: 700; font-size: 14px; letter-spacing: 0.02em; display: inline-flex; align-items: center; justify-content: center; gap: 8px; }
+    .flixers-toggle--ghost { background: rgba(255,255,255,0.04); border-color: rgba(255,255,255,0.12); color: #c7d3ff; }
+    .flixers-typing { margin: 6px 0; font-size: 13px; color: #9aa5c4; }
+    .flixers-system-message { text-align: center; padding: 8px 12px; color: #9aa5c4; font-size: 12px; border-bottom: 1px solid rgba(255,255,255,0.04); }
+    .flixers-system-text { margin-right: 6px; }
+    .flixers-system-time { color: #64748b; font-size: 11px; }
+    
+    /* Sidebar mode styles */
+    .flixers-overlay.flixers-sidebar { position: fixed; right: 0; top: 0; bottom: 0; width: var(--flixers-sidebar-width); height: 100%; max-height: 100vh; border-radius: 0; padding: 12px var(--flixers-sidebar-gutter); margin: 0; gap: 12px; }
+    .flixers-overlay.flixers-sidebar .flixers-panel { height: 100%; max-height: 100vh; border-radius: 0; display: flex; flex-direction: column; box-sizing: border-box; overflow: hidden; }
+    .flixers-overlay.flixers-sidebar .flixers-messages { flex: 1; height: auto; min-height: 100px; overflow-y: auto; }
+    .flixers-overlay.flixers-sidebar .flixers-toggle-row { flex-shrink: 0; }
+    .flixers-overlay.flixers-sidebar .flixers-input-row { flex-shrink: 0; margin-top: 8px; }
+    .flixers-overlay.flixers-sidebar .flixers-header,
+    .flixers-overlay.flixers-sidebar .flixers-meta,
+    .flixers-overlay.flixers-sidebar .flixers-status,
+    .flixers-overlay.flixers-sidebar .flixers-messages-header,
+    .flixers-overlay.flixers-sidebar .flixers-typing { flex-shrink: 0; }
+    .flixers-overlay.flixers-sidebar.flixers-hidden { transform: translateX(calc(var(--flixers-sidebar-width) + 50px)); opacity: 0; pointer-events: none; }
+    .flixers-reopen { position: fixed; top: 50%; right: 24px; transform: translateY(-50%); z-index: var(--flixers-z-max) !important; background: linear-gradient(135deg, #ff6f61, #ffb27a); color: #0f1117; border: none; border-radius: 12px; padding: 14px 18px; font-weight: 800; font-size: 14px; box-shadow: 0 14px 32px rgba(255, 179, 122, 0.35); cursor: pointer; letter-spacing: 0.02em; writing-mode: vertical-rl; text-orientation: mixed; }
+    .flixers-reopen:hover { transform: translateY(-50%) scale(1.05); box-shadow: 0 18px 40px rgba(255, 179, 122, 0.45); }
+    .flixers-reopen--hidden { display: none; }
+    
+    /* Control bar - single chat toggle button on the right side */
+    .flixers-control-bar { position: fixed; top: 50%; right: calc(var(--flixers-sidebar-width) + 12px); transform: translateY(-50%); z-index: 2147483647 !important; display: flex; padding: 0; background: transparent; border: none; box-shadow: none; transition: right 0.3s ease, opacity 0.3s ease, transform 0.3s ease; pointer-events: auto !important; }
+    .flixers-control-bar.flixers-control-bar--collapsed { right: 24px; }
+    .flixers-control-bar.flixers-control-bar--autohidden { opacity: 0; transform: translateY(-50%) translateX(20px); pointer-events: none; }
+    .flixers-control-btn { width: 48px; height: 48px; border-radius: 50%; border: 1px solid rgba(255,255,255,0.2); background: rgba(0,0,0,0.75); backdrop-filter: blur(8px); color: #f8fafc; display: flex; align-items: center; justify-content: center; cursor: pointer !important; transition: all 0.2s ease; position: relative; pointer-events: auto !important; -webkit-user-select: none; user-select: none; box-shadow: 0 4px 16px rgba(0,0,0,0.4); }
+    .flixers-control-btn:hover { background: rgba(0,0,0,0.9); border-color: rgba(255,255,255,0.35); transform: scale(1.1); box-shadow: 0 6px 20px rgba(0,0,0,0.5); }
+    .flixers-control-btn:active { transform: scale(0.95); }
+    .flixers-control-btn--chat { background: rgba(0,0,0,0.75); }
+    .flixers-control-btn--chat:hover { background: rgba(0,0,0,0.9); }
+    .flixers-control-icon { font-size: 22px; line-height: 1; pointer-events: none; }
+    .flixers-control-badge { position: absolute; top: 4px; right: 4px; width: 10px; height: 10px; border-radius: 50%; background: linear-gradient(135deg, #ff6f61, #ffb27a); box-shadow: 0 0 8px rgba(255,111,97,0.6); animation: flixers-pulse 2s ease-in-out infinite; pointer-events: none; }
+    @keyframes flixers-pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.7; transform: scale(1.2); } }
+    
+    /* Netflix video container adjustments for sidebar mode */
+    .flixers-sidebar-active { width: 100% !important; margin: 0 !important; transition: width 0.3s ease !important; position: relative; }
+    .flixers-sidebar-active video { object-fit: contain !important; }
+    body.flixers-sidebar-mode { box-sizing: border-box; }
+    body.flixers-sidebar-mode .watch-video,
+    body.flixers-sidebar-mode [data-uia="video-canvas"],
+    body.flixers-sidebar-mode .VideoContainer { width: 100% !important; max-width: none !important; margin: 0 !important; transition: width 0.3s ease !important; position: relative; }
+    body.flixers-sidebar-mode .watch-video video,
+    body.flixers-sidebar-mode [data-uia="video-canvas"] video,
+    body.flixers-sidebar-mode .VideoContainer video { width: 100% !important; height: 100% !important; object-fit: contain !important; }
+    
+    /* Fullscreen overlay and sidebar adjustments */
+    :fullscreen #flixers-react-root,
+    :-webkit-full-screen #flixers-react-root { position: fixed !important; inset: 0 !important; z-index: 2147483647 !important; pointer-events: none !important; }
+    :fullscreen body.flixers-sidebar-mode,
+    :-webkit-full-screen body.flixers-sidebar-mode { padding-right: 0; }
+    :fullscreen .flixers-sidebar-active,
+    :-webkit-full-screen .flixers-sidebar-active { display: grid !important; grid-template-columns: 1fr var(--flixers-sidebar-width); width: 100% !important; max-width: none !important; margin: 0 !important; align-items: stretch; }
+    :fullscreen .flixers-sidebar-active video,
+    :-webkit-full-screen .flixers-sidebar-active video { width: 100% !important; height: 100% !important; object-fit: contain !important; }
+    :fullscreen .flixers-overlay,
+    :-webkit-full-screen .flixers-overlay { position: fixed !important; z-index: 2147483647 !important; top: 0; right: 0; bottom: 0; left: auto; height: 100%; width: var(--flixers-sidebar-width); pointer-events: auto !important; isolation: isolate; margin: 0 !important; }
+    :fullscreen .flixers-overlay.flixers-sidebar,
+    :-webkit-full-screen .flixers-overlay.flixers-sidebar { position: fixed !important; height: 100%; }
+    :fullscreen .flixers-reopen,
+    :-webkit-full-screen .flixers-reopen { position: fixed !important; top: 50% !important; right: 24px !important; z-index: 2147483647 !important; pointer-events: auto !important; }
+    :fullscreen .flixers-control-bar,
+    :-webkit-full-screen .flixers-control-bar { position: fixed !important; z-index: 2147483647 !important; pointer-events: auto !important; }
+    :fullscreen .flixers-control-bar.flixers-control-bar--collapsed,
+    :-webkit-full-screen .flixers-control-bar.flixers-control-bar--collapsed { right: 24px !important; }
+    :fullscreen .flixers-control-bar.flixers-control-bar--autohidden,
+    :-webkit-full-screen .flixers-control-bar.flixers-control-bar--autohidden { opacity: 0 !important; transform: translateY(-50%) translateX(20px) !important; pointer-events: none !important; }
+    :fullscreen .flixers-control-btn,
+    :-webkit-full-screen .flixers-control-btn { pointer-events: auto !important; cursor: pointer !important; z-index: 2147483647 !important; position: relative !important; }
+    :fullscreen .flixers-control-bar *,
+    :-webkit-full-screen .flixers-control-bar * { pointer-events: auto !important; }
+    :fullscreen .flixers-control-icon,
+    :-webkit-full-screen .flixers-control-icon { pointer-events: none !important; }
+    :fullscreen .flixers-overlay *,
+    :-webkit-full-screen .flixers-overlay * { pointer-events: auto !important; }
+    :fullscreen .flixers-panel,
+    :-webkit-full-screen .flixers-panel { pointer-events: auto !important; }
+    
+    /* Extra fullscreen isolation - prevent Netflix from capturing our clicks */
+    :fullscreen .flixers-control-bar,
+    :-webkit-full-screen .flixers-control-bar { isolation: isolate !important; contain: layout !important; }
+    :fullscreen .flixers-control-bar::before,
+    :-webkit-full-screen .flixers-control-bar::before { content: ''; position: absolute; inset: -10px; z-index: -1; }
+  `;
+  document.head.appendChild(style);
+}
+
 function throttle(fn, delay) {
   let last = 0;
   return (...args) => {
@@ -301,4 +2057,13 @@ function escapeHtml(str) {
     const map = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
     return map[ch] || ch;
   });
+}
+
+function hashCode(str) {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    hash = (hash << 5) - hash + str.charCodeAt(i);
+    hash |= 0;
+  }
+  return hash;
 }
