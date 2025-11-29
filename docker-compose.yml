@@ -6,3 +6,6 @@ services:
       - "4000:4000"
     environment:
       - PORT=4000
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
+      - JWT_SECRET=${JWT_SECRET}
+      - REQUIRE_ENCRYPTION=${REQUIRE_ENCRYPTION:-true}

@@ -92,7 +92,6 @@ h1 {
 .user-card {
   display: grid;
   grid-template-columns: auto 1fr;
-  grid-template-rows: auto auto;
   gap: 10px;
   align-items: center;
   padding: 10px;
@@ -102,7 +101,6 @@ h1 {
 }
 
 .avatar {
-  grid-row: span 2;
   width: 46px;
   height: 46px;
   border-radius: 14px;
@@ -114,12 +112,28 @@ h1 {
   font-weight: 800;
   font-size: 16px;
   text-transform: uppercase;
+  overflow: hidden;
+  background-size: cover;
+  background-position: center;
+}
+
+.avatar.avatar--image {
+  color: transparent;
+  background-color: #0b0e15;
 }
 
 .user-meta {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 6px;
+  width: 100%;
+}
+
+.meta-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
 }
 
 .user-name {
@@ -134,20 +148,20 @@ h1 {
 }
 
 .user-actions {
-  grid-column: span 2;
   display: flex;
   gap: 8px;
+  align-items: stretch;
 }
 
 .field-grid {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: 1fr;
   gap: 10px;
 }
 
 .share-row {
   display: grid;
-  grid-template-columns: 1fr 84px;
+  grid-template-columns: 1fr 126px;
   gap: 6px;
   align-items: center;
 }
@@ -181,22 +195,36 @@ input:focus {
   box-shadow: 0 0 0 3px rgba(255, 111, 97, 0.18);
 }
 
+.jitter {
+  animation: jitter 220ms ease;
+}
+
+@keyframes jitter {
+  0% { transform: translateX(0); }
+  25% { transform: translateX(-3px); }
+  50% { transform: translateX(3px); }
+  75% { transform: translateX(-2px); }
+  100% { transform: translateX(0); }
+}
+
 .actions {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  display: flex;
   gap: 8px;
+  align-items: stretch;
 }
 
 button {
-  padding: 10px;
+  padding: 12px;
   border: none;
   border-radius: 10px;
   font-weight: 700;
+  font-size: 13px;
   color: #0b0e15;
   cursor: pointer;
   transition: transform 0.08s ease, box-shadow 0.2s ease, opacity 0.2s ease;
   background: linear-gradient(135deg, #ff6f61, #ffb27a);
   box-shadow: 0 8px 22px rgba(255, 111, 97, 0.22);
+  min-height: 42px;
 }
 
 button:hover {
@@ -215,6 +243,7 @@ button.ghost {
   color: var(--text);
   border: 1px dashed var(--border);
   box-shadow: none;
+  padding: 11px;
 }
 
 button.muted {
@@ -222,6 +251,7 @@ button.muted {
   color: var(--muted);
   border: 1px solid var(--border);
   box-shadow: none;
+  padding: 11px;
 }
 
 .status-row {
@@ -360,15 +390,18 @@ button.muted {
 
 .chat-form button {
   width: 100%;
+  min-height: 38px;
 }
 
 .pill-btn {
-  padding: 6px 10px;
+  padding: 8px 12px;
   border: 1px solid var(--border);
   border-radius: 999px;
   background: #141b2b;
   color: var(--text);
   font-weight: 600;
+  font-size: 12px;
+  min-height: 36px;
 }
 
 .pill-btn.muted {

@@ -1,18 +1,16 @@
 // Popup logic for Flixers
 const API_BASE = "http://localhost:4000";
-const GOOGLE_CLIENT_ID = ""; // TODO: set your OAuth client ID
-const REDIRECT_URI = `https://${chrome.runtime.id}.chromiumapp.org/`;
+const GOOGLE_CLIENT_ID = "400373504190-dasf4eoqp7oqaikurtq9b9gqi32oai6t.apps.googleusercontent.com";
+// chrome.identity.getRedirectURL() respects the runtime ID for this profile, avoiding mismatches.
+const REDIRECT_URI = 'https://ockfmnmfmegmooikhkbkhhpjkfngncmn.chromiumapp.org/';
 
-const nameInput = document.getElementById("name");
-const roomInput = document.getElementById("room");
+const roomLinkInput = document.getElementById("room-link");
 const statusEl = document.getElementById("status");
 const presenceChips = document.getElementById("presence-chips");
 const connectionPill = document.getElementById("connection-pill");
 const messagesEl = document.getElementById("messages");
 const chatInput = document.getElementById("chat-input");
 const toastStack = document.getElementById("toast-stack");
-const roomLinkInput = document.getElementById("room-link");
-const copyLinkBtn = document.getElementById("copy-link");
 const avatarEl = document.getElementById("user-avatar");
 const userNameEl = document.getElementById("user-name");
 const userEmailEl = document.getElementById("user-email");
@@ -25,6 +23,7 @@ const state = {
   participants: [],
   session: null,
   pendingRoomId: null,
+  hasPlayer: false,
 };
 
 signInBtn.addEventListener("click", handleSignIn);
@@ -48,7 +47,7 @@ document.getElementById("create").addEventListener("click", async () => {
     });
     if (!res.ok) throw new Error("create failed");
     const data = await res.json();
-    roomInput.value = data.roomId;
+    roomLinkInput.value = data.roomId;
     roomLinkInput.value = buildShareLink(data.roomId);
     await joinRoom(data.roomId);
     pushToast(`New room created (${data.roomId})`, "info");
@@ -60,30 +59,33 @@ document.getElementById("create").addEventListener("click", async () => {
   }
 });
 
-document.getElementById("join").addEventListener("click", async () => {
-  lockControls(true);
-  const candidate = roomLinkInput.value.trim() || roomInput.value.trim();
-  const targetRoom = parseRoomId(candidate) || state.pendingRoomId;
+roomLinkInput.addEventListener("paste", async (e) => {
+  const text = (e.clipboardData || window.clipboardData)?.getData("text")?.trim() || "";
+  if (!text) return;
+  e.preventDefault();
+  roomLinkInput.value = text;
+  const targetRoom = parseRoomId(text);
   if (!targetRoom) {
-    pushToast("Paste a room link or create one first", "warn");
-    lockControls(false);
+    jitterInput(roomLinkInput);
+    pushToast("That doesn't look like a room link", "warn");
     return;
   }
   if (!state.session) {
     state.pendingRoomId = targetRoom;
+    jitterInput(roomLinkInput);
     pushToast("Sign in to join this room", "warn");
-    lockControls(false);
     return;
   }
   await joinRoom(targetRoom);
-  lockControls(false);
 });
 
 document.getElementById("leave").addEventListener("click", async () => {
   await chrome.runtime.sendMessage({ type: "leave-room" });
+  state.connected = false;
   setRoom(null);
   setStatus("Left the room");
   setConnectionPill("idle", "Idle");
+  updateVisibility();
   pushToast("Disconnected from room", "info");
 });
 
@@ -91,24 +93,13 @@ document.getElementById("clear-chat").addEventListener("click", () => {
   messagesEl.innerHTML = "";
 });
 
-copyLinkBtn.addEventListener("click", () => {
-  if (!state.roomId) {
-    pushToast("Create or join a room first", "warn");
-    return;
-  }
-  const link = buildShareLink(state.roomId);
-  roomLinkInput.value = link;
-  navigator.clipboard.writeText(link).then(
-    () => pushToast("Link copied", "info"),
-    () => pushToast("Copy failed", "warn")
-  );
-});
-
 async function handleSignIn() {
   if (!GOOGLE_CLIENT_ID) {
     pushToast("Set GOOGLE_CLIENT_ID in popup.js to enable sign-in", "warn");
     return;
   }
+  console.info("Flixers auth redirect URI:", REDIRECT_URI);
+  pushToast(`Auth redirect: ${REDIRECT_URI}`, "info");
   try {
     const authUrl = buildGoogleAuthUrl();
     const redirectUrl = await launchWebAuthFlow(authUrl);
@@ -118,8 +109,10 @@ async function handleSignIn() {
     await setSession(session);
     pushToast(`Signed in as ${session.profile?.name || "user"}`, "info");
   } catch (err) {
-    console.warn("Sign-in failed", err);
-    pushToast("Google sign-in failed", "warn");
+    const reason = err?.message || String(err);
+    console.warn("Google sign-in failed", err);
+    pushToast(`Google sign-in failed: ${reason}`, "warn");
+    pushToast(`Check OAuth redirect: ${REDIRECT_URI}`, "warn");
   }
 }
 
@@ -127,7 +120,10 @@ async function handleSignOut() {
   await chrome.runtime.sendMessage({ type: "auth-clear" });
   await chrome.storage.local.remove(["flixersSession"]);
   state.session = null;
+  state.connected = false;
   applySession(null);
+  clearChat();
+  setConnectionPill("idle", "Idle");
   setStatus("Signed out");
   pushToast("Signed out", "info");
 }
@@ -138,6 +134,10 @@ document.getElementById("chat-form").addEventListener("submit", async (e) => {
   if (!text) return;
   const session = requireSession();
   if (!session) return;
+  if (!state.roomId) {
+    pushToast("Join a room first", "warn");
+    return;
+  }
   chatInput.value = "";
   await chrome.runtime.sendMessage({ type: "chat", text });
   pushMessage(session.profile?.name || "You", text, Date.now());
@@ -148,6 +148,8 @@ chrome.runtime.onMessage.addListener((msg) => {
     const isConnected = msg.status === "connected";
     state.connected = isConnected;
     setConnectionPill(isConnected ? "ok" : "bad", msg.status);
+    setStatus(`Connection: ${msg.status}`);
+    updateVisibility();
     if (!isConnected) pushToast("Trying to reconnect…", "warn");
   }
   if (msg.type === "chat") {
@@ -164,17 +166,53 @@ chrome.runtime.onMessage.addListener((msg) => {
     const count = msg.users?.length ?? 0;
     setStatus(`Room ${msg.roomId || ""} · ${count} online`);
   }
+  if (msg.type === "auth") {
+    state.session = msg.session || null;
+    applySession(state.session);
+    if (!state.session) {
+      setRoom(null);
+      setStatus("Signed out");
+      clearChat();
+      setConnectionPill("idle", "Idle");
+    }
+  }
+  if (msg.type === "player-present") {
+    state.hasPlayer = !!msg.present;
+    if (!state.hasPlayer && state.roomId) {
+      setStatus("Open Netflix to chat");
+    }
+    updateVisibility();
+  }
+});
+
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName !== "local" || !changes.flixersSession) return;
+  const session = changes.flixersSession.newValue || null;
+  state.session = session;
+  applySession(session);
+  if (!session) {
+    setRoom(null);
+    setStatus("Signed out");
+  }
 });
 
 function buildGoogleAuthUrl() {
+  const nonce = generateNonce();
   const params = new URLSearchParams({
     client_id: GOOGLE_CLIENT_ID,
     redirect_uri: REDIRECT_URI,
     response_type: "id_token",
     scope: "openid email profile",
+    nonce: nonce,
     prompt: "select_account",
   });
   return `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
+}
+
+function generateNonce() {
+  const array = new Uint8Array(16);
+  crypto.getRandomValues(array);
+  return Array.from(array, byte => byte.toString(16).padStart(2, '0')).join('');
 }
 
 function launchWebAuthFlow(url) {
@@ -223,18 +261,24 @@ async function setSession(session) {
 
 function applySession(session) {
   const profile = session?.profile;
-  nameInput.value = profile?.name || "";
-  nameInput.disabled = !!profile?.name;
   userNameEl.textContent = profile?.name || "Not signed in";
   userEmailEl.textContent = profile?.email || "Sign in to load your Google name";
-  avatarEl.textContent = (profile?.name || "?").slice(0, 1).toUpperCase();
+  const initial = (profile?.name || "?").slice(0, 1).toUpperCase();
+  avatarEl.textContent = initial;
+  if (profile?.picture) {
+    avatarEl.style.backgroundImage = `url(${profile.picture})`;
+    avatarEl.classList.add("avatar--image");
+  } else {
+    avatarEl.style.backgroundImage = "";
+    avatarEl.classList.remove("avatar--image");
+  }
   const authed = !!session;
   signOutBtn.disabled = !authed;
   signInBtn.disabled = authed;
   signOutBtn.classList.toggle("hidden", !authed);
   signInBtn.classList.toggle("hidden", authed);
   document.getElementById("create").disabled = !authed;
-  document.getElementById("join").disabled = !authed;
+  updateVisibility();
 }
 
 function requireSession() {
@@ -267,6 +311,7 @@ async function joinRoom(roomId) {
     pushToast(`Joining ${roomId} as ${displayName}`, "info");
   } catch (err) {
     setStatus("Failed to join room");
+    jitterInput(roomLinkInput);
     pushToast("Could not join room", "warn");
   }
 }
@@ -286,7 +331,6 @@ function setConnectionPill(kind, text) {
 function lockControls(disabled) {
   const authed = !!state.session;
   document.getElementById("create").disabled = disabled || !authed;
-  document.getElementById("join").disabled = disabled || !authed;
   document.getElementById("leave").disabled = disabled;
 }
 
@@ -303,6 +347,10 @@ function pushMessage(from, text, ts) {
   `;
   messagesEl.appendChild(div);
   messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+function clearChat() {
+  if (messagesEl) messagesEl.innerHTML = "";
 }
 
 function renderPresence(users) {
@@ -323,19 +371,27 @@ function renderPresence(users) {
 function setRoom(roomId, name = state.session?.profile?.name) {
   state.roomId = roomId;
   state.roomName = name || "Guest";
-  roomInput.value = roomId || "";
   roomLinkInput.value = roomId ? buildShareLink(roomId) : "";
   if (roomId) {
     setStatus(`Reattached to room ${roomId}`);
   } else {
     renderPresence([]);
   }
+  updateVisibility();
 }
 
 function buildShareLink(roomId) {
   return `chrome-extension://${chrome.runtime.id}/popup.html?room=${encodeURIComponent(
     roomId
   )}`;
+}
+
+function updateVisibility() {
+  const inRoom = !!state.roomId;
+  const showChat = inRoom && state.connected && state.hasPlayer;
+  document.getElementById("leave").classList.toggle("hidden", !inRoom);
+  document.getElementById("chat-panel").classList.toggle("hidden", !showChat);
+  document.getElementById("clear-chat").classList.toggle("hidden", !showChat);
 }
 
 function parseRoomId(input) {
@@ -367,6 +423,13 @@ function pushToast(text, variant = "info") {
   }, 2600);
 }
 
+function jitterInput(el) {
+  if (!el) return;
+  el.classList.remove("jitter");
+  void el.offsetWidth; // force reflow
+  el.classList.add("jitter");
+}
+
 function escapeHtml(str = "") {
   return str.replace(/[&<>"']/g, (ch) => {
     const map = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
@@ -387,7 +450,6 @@ function escapeHtml(str = "") {
   const urlRoom = parseRoomId(new URL(window.location.href).searchParams.get("room"));
   if (urlRoom) {
     state.pendingRoomId = urlRoom;
-    roomInput.value = urlRoom;
     roomLinkInput.value = buildShareLink(urlRoom);
     pushToast(`Link detected for room ${urlRoom}`, "info");
     if (state.session) {
@@ -397,9 +459,15 @@ function escapeHtml(str = "") {
   }
   chrome.runtime.sendMessage({ type: "get-room" }, (res) => {
     if (res?.roomId) {
-      roomInput.value = res.roomId;
+      roomLinkInput.value = res.roomId;
       setRoom(res.roomId, session?.profile?.name || res.name || "Guest");
       setStatus(`Reattached to room ${res.roomId}`);
+    }
+  });
+  chrome.runtime.sendMessage({ type: "player-status" }, (res) => {
+    if (res && typeof res.present === "boolean") {
+      state.hasPlayer = res.present;
+      updateVisibility();
     }
   });
 })();

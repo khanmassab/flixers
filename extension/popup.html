@@ -20,32 +20,28 @@
         <div class="user-card">
           <div class="avatar" id="user-avatar">?</div>
           <div class="user-meta">
-            <p id="user-name" class="user-name">Not signed in</p>
-            <p id="user-email" class="user-email">Sign in to load your Google name</p>
-          </div>
-          <div class="user-actions">
+            <div class="meta-top">
+              <div>
+                <p id="user-name" class="user-name">Not signed in</p>
+                <p id="user-email" class="user-email">Sign in to load your Google name</p>
+              </div>
+              <button id="signout" class="pill-btn muted">Sign out</button>
+            </div>
             <button id="signin" class="pill-btn">Sign in with Google</button>
-            <button id="signout" class="pill-btn muted">Sign out</button>
           </div>
         </div>
         <div class="field-grid">
           <label>
-            Display name
-            <input id="name" type="text" placeholder="Guest" />
-          </label>
-          <label>
             Room link (share)
             <div class="share-row">
               <input id="room-link" type="text" placeholder="Paste room link or ID" />
-              <button id="copy-link" type="button" class="pill-btn">Copy</button>
+              <button id="create" type="button" class="pill-btn">Create new room</button>
             </div>
-            <p class="hint">Create a room or paste a shared link to join.</p>
+            <p class="hint">Paste a shared link to join instantly, or create a new room.</p>
           </label>
         </div>
         <div class="actions">
-          <button id="join">Join from link</button>
-          <button id="create" class="ghost">Create new room</button>
-          <button id="leave" class="muted">Leave</button>
+          <button id="leave" class="muted hidden">Leave</button>
         </div>
         <div class="status-row">
           <div>
@@ -59,7 +55,7 @@
         </div>
       </section>
 
-      <section class="panel panel--chat">
+      <section class="panel panel--chat hidden" id="chat-panel">
         <div class="chat-top">
           <div>
             <p class="overline">Live chat</p>

@@ -6,6 +6,7 @@ let currentRoom = null;
 let displayName = "Guest";
 let retryTimer = null;
 let session = null;
+let hasNetflixPlayer = false;
 
 chrome.storage.local.get(["flixersSession"]).then((res) => {
   if (res.flixersSession) {
@@ -39,14 +40,26 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       session = message.session;
       displayName = session?.profile?.name || "Guest";
       chrome.storage.local.set({ flixersSession: session || null });
+      broadcastPopup({ type: "auth", session });
       return true;
     case "auth-clear":
       session = null;
       displayName = "Guest";
+      teardownSocket();
+      currentRoom = null;
       chrome.storage.local.remove(["flixersSession"]);
+      broadcastPopup({ type: "auth", session: null });
+      broadcastPopup({ type: "ws-status", status: "disconnected" });
       return true;
     case "auth-get":
       sendResponse({ session });
+      return true;
+    case "player-present":
+      hasNetflixPlayer = true;
+      broadcastPopup({ type: "player-present", present: true });
+      return true;
+    case "player-status":
+      sendResponse({ present: hasNetflixPlayer });
       return true;
     default:
       return false;
@@ -173,6 +186,26 @@ function broadcastPopup(msg) {
   chrome.runtime.sendMessage(msg, () => {
     // Service workers ignore errors when no listener is present.
   });
+}
+
+chrome.tabs.onRemoved.addListener(() => checkNetflixTabs());
+chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
+  if (changeInfo.status === "complete" && tab.url && tab.url.includes("netflix.com")) {
+    checkNetflixTabs();
+  }
+});
+
+function checkNetflixTabs() {
+  chrome.tabs
+    .query({ url: "*://*.netflix.com/*" })
+    .then((tabs) => {
+      const present = tabs.length > 0;
+      if (present !== hasNetflixPlayer) {
+        hasNetflixPlayer = present;
+        broadcastPopup({ type: "player-present", present });
+      }
+    })
+    .catch(() => {});
 }
 
 function sendToNetflixTabs(msg) {

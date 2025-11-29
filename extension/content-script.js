@@ -2,12 +2,17 @@ const PlayerSync = (() => {
   let video = null;
   let suppressNext = false;
   let observer = null;
+  let announced = false;
 
   const attach = () => {
     const candidate = document.querySelector("video");
     if (!candidate || candidate === video) return;
     video = candidate;
     wirePlayer(video);
+    if (!announced) {
+      announced = true;
+      chrome.runtime.sendMessage({ type: "player-present" });
+    }
   };
 
   const wirePlayer = (el) => {
