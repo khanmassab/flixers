@@ -26,13 +26,31 @@ let lastVideoUrl = null;
 let currentParticipants = [];
 let connectionStatus = "idle";
 const playbackState = new Map(); // roomId -> { paused, t }
+let lastOutboundState = null; // Last playback state we sent (for resync after reconnect)
+let lastEpisodePath = null; // Track last episode URL path to avoid duplicate announcements
 
 // Message queue for offline/reconnecting scenarios
 const messageQueue = [];
 const MAX_QUEUE_SIZE = 100; // Max messages to queue
+const QUEUE_STORAGE_PREFIX = "flixers-queue-";
 
-// Message retention period (1 day in milliseconds)
-const MESSAGE_RETENTION_MS = 24 * 60 * 60 * 1000;
+// Message retention period (1 year in milliseconds) - keep until room is explicitly removed
+const MESSAGE_RETENTION_MS = 365 * 24 * 60 * 60 * 1000;
+
+// Lightweight fetch wrapper with timeout to avoid hung reconnect checks
+async function fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
+  if (typeof AbortController === "undefined") {
+    return fetch(url, options);
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    return res;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 // ============ Key Persistence Functions ============
 
@@ -200,11 +218,16 @@ async function cleanupExpiredKeys() {
 let heartbeatInterval = null;
 let lastPongTime = Date.now();
 let reconnectAttempts = 0;
-const HEARTBEAT_INTERVAL = 25000; // Send ping every 25 seconds
-const HEARTBEAT_TIMEOUT = 35000; // Consider connection dead if no pong in 35s
-const MAX_RECONNECT_ATTEMPTS = 10;
+let connectionAlerted = false;
+const HEARTBEAT_INTERVAL = 15000; // Send ping every 15 seconds
+const HEARTBEAT_TIMEOUT = 40000; // Consider connection dead if no pong in ~40s (aggressive for proxy/LB timeouts)
 const BASE_RECONNECT_DELAY = 1000; // Start with 1 second
 const MAX_RECONNECT_DELAY = 30000; // Max 30 seconds between attempts
+const PERSISTENT_RECONNECT_DELAY = 30000; // Keep retrying every ~30s after backoff caps
+let lastCloseCode = null;
+let lastCloseReason = "";
+let lastVisibilityCheck = 0;
+let lastPresenceAvatars = {};
 
 // Sync handshake state
 let pendingSyncRequest = false;
@@ -252,9 +275,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       // Clear keys when explicitly leaving a room
       if (currentRoom) {
         clearPersistedKeys(currentRoom);
+        clearPersistedQueue(currentRoom);
+        clearMessageQueue(false);
       }
       teardownSocket(false, true); // Clear all keys and reset attempts
       currentRoom = null;
+      lastEpisodePath = null;
+      lastVideoUrl = null;
       sendToNetflixTabs({ type: "room-update", roomId: null, name: displayName });
       sendResponse({ ok: true });
       return true;
@@ -272,20 +299,34 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ roomId: currentRoom, name: displayName });
       return true;
     case "get-presence":
-      sendResponse({ users: currentParticipants, roomId: currentRoom });
+      sendResponse({ users: currentParticipants, roomId: currentRoom, avatars: lastPresenceAvatars });
       return true;
     case "get-connection-status":
-      // When popup asks for status, also verify connection is healthy
+      // When popup/content asks for status, also verify connection is healthy
       if (currentRoom && connectionStatus === "connected") {
         // Quick check if WS is actually open
         if (!ws || ws.readyState !== WebSocket.OPEN) {
-          console.log("[WS] Popup status check: connection state mismatch, triggering reconnect");
+          console.log("[WS] Status check: connection state mismatch, triggering reconnect");
           scheduleReconnect();
-          sendResponse({ status: "reconnecting", roomId: currentRoom });
+          sendResponse({
+            status: "reconnecting",
+            roomId: currentRoom,
+            lastPongTime,
+            readyState: ws?.readyState ?? 3,
+          });
           return true;
         }
       }
-      sendResponse({ status: connectionStatus, roomId: currentRoom });
+      sendResponse({
+        status: connectionStatus,
+        roomId: currentRoom,
+        lastPongTime,
+        readyState: ws?.readyState ?? 3,
+      });
+      return true;
+    case "force-reconnect":
+      scheduleReconnect(true);
+      sendResponse({ ok: true });
       return true;
     case "auth-set":
       session = message.session;
@@ -300,9 +341,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       // Clear all keys when signing out
       if (currentRoom) {
         clearPersistedKeys(currentRoom);
+        clearPersistedQueue(currentRoom);
+        clearMessageQueue(false);
       }
       teardownSocket(false, true); // Clear all keys and reset attempts
       currentRoom = null;
+      lastEpisodePath = null;
+      lastVideoUrl = null;
       chrome.storage.local.remove(["flixersSession"]);
       broadcastPopup({ type: "auth", session: null });
       broadcastPopup({ type: "ws-status", status: "disconnected" });
@@ -312,7 +357,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ session });
       return true;
     case "player-present":
-      updatePlayerStatus(true, !!message.playing, message.url);
+      updatePlayerStatus(!!message.present, !!message.playing, message.url);
+      return true;
+    case "episode-changed":
+      handleEpisodeChanged(message.url);
       return true;
     case "player-status":
       sendResponse({
@@ -376,14 +424,17 @@ async function handleJoin(roomId, name, token) {
   // Clear keys from old room if changing rooms
   if (currentRoom && currentRoom !== roomId) {
     clearPersistedKeys(currentRoom);
+    clearPersistedQueue(currentRoom);
+    clearMessageQueue(false);
     teardownSocket(false, true); // Clear all keys and reset attempts for room change
   } else {
     teardownSocket(true, true); // Preserve keys but reset attempts for rejoining
   }
   
-  clearMessageQueue(); // Clear any messages from previous room
-  clearOtherRoomMessages(roomId); // Clear messages from other rooms
+  lastEpisodePath = null;
+  lastVideoUrl = null;
   currentRoom = roomId;
+  await loadPersistedQueue(currentRoom);
   pendingSyncRequest = false;
   hasRespondedToSync = false;
   sendToNetflixTabs({ type: "room-update", roomId, name: displayName });
@@ -434,14 +485,17 @@ async function handleConfirmJoin(roomId, name, token, videoUrl, initialTime) {
   // Clear keys from old room if changing rooms
   if (currentRoom && currentRoom !== roomId) {
     clearPersistedKeys(currentRoom);
+    clearPersistedQueue(currentRoom);
+    clearMessageQueue(false);
     teardownSocket(false, true); // Clear all keys and reset attempts for room change
   } else {
     teardownSocket(true, true); // Preserve keys but reset attempts for rejoining
   }
   
-  clearMessageQueue(); // Clear any messages from previous room
-  clearOtherRoomMessages(roomId); // Clear messages from other rooms
+  lastEpisodePath = null;
+  lastVideoUrl = null;
   currentRoom = roomId;
+  await loadPersistedQueue(currentRoom);
   pendingSyncRequest = true; // Will request sync once connected
   hasRespondedToSync = false;
   
@@ -535,20 +589,50 @@ async function connectSocket() {
     clearTimeout(retryTimer);
     retryTimer = null;
     connectionStatus = "connected";
+    if (connectionAlerted) {
+      emitLocalSystem("Reconnected to room");
+    }
+    connectionAlerted = false;
     reconnectAttempts = 0; // Reset on successful connection
     lastPongTime = Date.now();
     broadcastPopup({ type: "ws-status", status: "connected" });
     sendToNetflixTabs({ type: "ws-status", status: "connected" });
-    announceKeyExchange();
-    startHeartbeat();
+    lastCloseCode = null;
+    lastCloseReason = "";
     
-    // Flush any queued messages after a short delay (wait for key exchange)
+    // Announce key exchange immediately
+    announceKeyExchange();
+    
+    // Re-announce after a delay to catch peers who connected after us
+    setTimeout(() => {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        console.log("[Crypto] Re-announcing key exchange after reconnection");
+        announceKeyExchange();
+      }
+    }, 2000);
+    
+    startHeartbeat();
+
+    // Request a fresh sync when we reconnect to avoid drift
+    setTimeout(() => {
+      pendingSyncRequest = true;
+      sendSyncRequest();
+    }, 600);
+
+    // Re-send our latest outbound playback state to help others catch up
+    if (lastOutboundState) {
+      setTimeout(() => {
+        sendStateSnapshot(lastOutboundState);
+      }, 1200);
+    }
+    
+    // Flush any queued messages after key exchange has time to complete
     setTimeout(() => {
       if (messageQueue.length > 0) {
         emitLocalSystem(`Sending ${messageQueue.length} queued message${messageQueue.length > 1 ? 's' : ''}...`);
         flushMessageQueue();
       }
-    }, 1000);
+    }, 2500);
   });
 
   ws.addEventListener("message", (event) => {
@@ -585,8 +669,12 @@ async function connectSocket() {
   });
 
   ws.addEventListener("close", (event) => {
+    lastCloseCode = event.code;
+    lastCloseReason = event.reason || "";
     console.log("[WS] Connection closed:", event.code, event.reason);
     stopHeartbeat();
+    broadcastPopup({ type: "ws-status", status: "closed", code: event.code, reason: event.reason });
+    sendToNetflixTabs({ type: "ws-status", status: "closed", code: event.code, reason: event.reason });
     scheduleReconnect();
   });
 
@@ -639,19 +727,40 @@ function checkConnectionHealth() {
   const timeSinceLastPong = Date.now() - lastPongTime;
   if (timeSinceLastPong > HEARTBEAT_TIMEOUT) {
     console.warn("[WS] Connection health check: stale connection detected, reconnecting");
+    console.warn("[WS] Last close code:", lastCloseCode, "reason:", lastCloseReason);
     ws.close(4001, "Stale connection");
     scheduleReconnect();
   }
 }
 
 // Periodically check connection health (catches zombie connections)
-setInterval(checkConnectionHealth, 45000);
+setInterval(checkConnectionHealth, 20000);
 
 // Listen for alarm to help with system wake detection
 // Service workers can be suspended, this helps recover connections
 chrome.alarms?.create?.("flixers-keepalive", { periodInMinutes: 0.5 });
 chrome.alarms?.onAlarm?.addListener?.((alarm) => {
   if (alarm.name === "flixers-keepalive" && currentRoom) {
+    checkConnectionHealth();
+  }
+});
+
+// Resume hooks: when the browser comes back online or the service worker starts, re-check health
+self?.addEventListener?.("online", () => {
+  if (currentRoom) {
+    console.log("[WS] Online event detected, checking connection health");
+    checkConnectionHealth();
+  }
+});
+
+self?.addEventListener?.("offline", () => {
+  console.log("[WS] Offline detected, pausing heartbeat");
+  stopHeartbeat();
+});
+
+chrome.runtime?.onStartup?.addListener?.(() => {
+  if (currentRoom) {
+    console.log("[WS] Runtime startup detected, checking connection health");
     checkConnectionHealth();
   }
 });
@@ -694,6 +803,7 @@ function teardownSocket(preserveKeys = true, resetAttempts = false) {
   
   currentParticipants = [];
   connectionStatus = "idle";
+  connectionAlerted = false;
   
   // Only reset reconnect attempts when explicitly requested (room change, leave, etc.)
   // NOT during reconnection attempts
@@ -708,7 +818,7 @@ function teardownSocket(preserveKeys = true, resetAttempts = false) {
   playbackState.delete(currentRoom);
 }
 
-function scheduleReconnect() {
+function scheduleReconnect(forceImmediate = false) {
   stopHeartbeat();
   
   // Don't reconnect if we've left the room intentionally
@@ -721,38 +831,35 @@ function scheduleReconnect() {
   
   // Already have a reconnect scheduled or already connecting
   if (retryTimer || connectionStatus === "connecting") {
-    console.log("[WS] Reconnect already scheduled or in progress, skipping");
-    return;
+    if (forceImmediate && retryTimer) {
+      clearTimeout(retryTimer);
+      retryTimer = null;
+    } else {
+      console.log("[WS] Reconnect already scheduled or in progress, skipping");
+      return;
+    }
   }
   
-  // Check if we've exceeded max attempts
-  if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-    console.error("[WS] Max reconnect attempts reached, giving up");
-    connectionStatus = "disconnected";
-    broadcastPopup({ type: "ws-status", status: "disconnected" });
-    sendToNetflixTabs({ type: "ws-status", status: "disconnected" });
-    emitLocalSystem("Connection lost. Please leave and rejoin the room.");
-    
-    // After giving up, reset attempts after a delay so manual retry works
-    setTimeout(() => {
-      if (connectionStatus === "disconnected") {
-        reconnectAttempts = 0;
-        console.log("[WS] Reset reconnect attempts for future manual retry");
-      }
-    }, 60000);
-    return;
+  if (!connectionAlerted) {
+    emitLocalSystem("Connection lost. Reconnecting...");
+    connectionAlerted = true;
   }
   
-  // Calculate exponential backoff delay with jitter to avoid thundering herd
-  const baseDelay = Math.min(
-    BASE_RECONNECT_DELAY * Math.pow(2, reconnectAttempts),
+  // Calculate exponential backoff delay with jitter to avoid thundering herd.
+  // Clamp exponent growth once we hit the max delay to avoid huge numbers.
+  const cappedAttempts = Math.min(reconnectAttempts, 10);
+  const backoffDelay = Math.min(
+    BASE_RECONNECT_DELAY * Math.pow(2, cappedAttempts),
     MAX_RECONNECT_DELAY
   );
+  // After the backoff tops out, keep retrying on a slower fixed cadence to persist connections.
+  const baseDelay =
+    backoffDelay >= MAX_RECONNECT_DELAY ? PERSISTENT_RECONNECT_DELAY : backoffDelay;
   const jitter = Math.random() * 1000; // Add up to 1s of random jitter
-  const delay = Math.floor(baseDelay + jitter);
+  const delay = forceImmediate ? 0 : Math.floor(baseDelay + jitter);
   reconnectAttempts++;
   
-  console.log(`[WS] Scheduling reconnect attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS} in ${delay}ms`);
+  console.log(`[WS] Scheduling reconnect attempt #${reconnectAttempts} in ${delay}ms`);
   connectionStatus = "reconnecting";
   broadcastPopup({ type: "ws-status", status: "reconnecting" });
   sendToNetflixTabs({ type: "ws-status", status: "reconnecting" });
@@ -765,6 +872,12 @@ function scheduleReconnect() {
 
 // Attempt to reconnect - verify room still exists before connecting
 async function attemptReconnect() {
+  if (typeof navigator !== "undefined" && navigator.onLine === false) {
+    console.warn("[WS] Browser reports offline, deferring reconnect");
+    scheduleReconnect();
+    return;
+  }
+
   if (!currentRoom || !session?.token) {
     connectionStatus = "disconnected";
     broadcastPopup({ type: "ws-status", status: "disconnected" });
@@ -776,22 +889,39 @@ async function attemptReconnect() {
   
   // Verify room still exists on server
   try {
-    const res = await fetch(`${BACKEND_HTTP}/rooms/${currentRoom}/preview`, {
+    const res = await fetchWithTimeout(`${BACKEND_HTTP}/rooms/${currentRoom}/preview`, {
       method: "GET",
       headers: {
         Authorization: `Bearer ${session.token}`,
       },
-    });
+    }, 5000);
     
+    if (res.status === 401 || res.status === 403) {
+      console.error("[WS] Auth expired while reconnecting");
+      connectionStatus = "auth-required";
+      broadcastPopup({ type: "ws-status", status: "auth-required" });
+      sendToNetflixTabs({ type: "ws-status", status: "auth-required" });
+      return;
+    }
+
     if (!res.ok) {
-      // Room no longer exists
-      console.error("[WS] Room no longer exists, cannot reconnect");
-      connectionStatus = "disconnected";
-      broadcastPopup({ type: "ws-status", status: "disconnected" });
-      sendToNetflixTabs({ type: "ws-status", status: "disconnected" });
-      emitLocalSystem("Room expired. Please create or join a new room.");
-      currentRoom = null;
-      sendToNetflixTabs({ type: "room-update", roomId: null, name: displayName });
+      if (res.status === 404) {
+        // Room no longer exists
+        console.error("[WS] Room no longer exists, cannot reconnect");
+        connectionStatus = "disconnected";
+        broadcastPopup({ type: "ws-status", status: "disconnected" });
+        sendToNetflixTabs({ type: "ws-status", status: "disconnected" });
+        emitLocalSystem("Room expired. Please create or join a new room.");
+        await clearPersistedQueue(currentRoom);
+        notifyRoomDeleted(currentRoom);
+        currentRoom = null;
+        lastEpisodePath = null;
+        lastVideoUrl = null;
+        sendToNetflixTabs({ type: "room-update", roomId: null, name: displayName });
+        return;
+      }
+      console.warn("[WS] Preview check failed, retrying later:", res.status);
+      scheduleReconnect();
       return;
     }
     
@@ -800,6 +930,8 @@ async function attemptReconnect() {
   } catch (err) {
     console.warn("[WS] Failed to verify room:", err.message);
     // Continue anyway - might be a network blip
+    scheduleReconnect();
+    return;
   }
   
   connectSocket();
@@ -832,17 +964,20 @@ function routeIncoming(message) {
   }
   if (message.type === "presence") {
     const next = message.users || [];
+    lastPresenceAvatars = message.avatars || {};
     broadcastPopup({
       type: "presence",
       users: next,
       roomId: currentRoom,
       encryptionRequired: message.encryptionRequired,
+      avatars: message.avatars || {},
     });
     sendToNetflixTabs({
       type: "presence",
       users: next,
       roomId: currentRoom,
       encryptionRequired: message.encryptionRequired,
+      avatars: message.avatars || {},
     });
     if (typeof message.encryptionRequired === "boolean") {
       encryptionRequired = message.encryptionRequired;
@@ -882,6 +1017,9 @@ function routeIncoming(message) {
     };
     broadcastPopup(typingMsg);
     sendToNetflixTabs(typingMsg);
+  }
+  if (message.type === "episode-changed") {
+    sendToNetflixTabs({ type: "episode-changed", url: message.url });
   }
   
   // Sync handshake: someone is requesting sync state
@@ -926,15 +1064,36 @@ function routeIncoming(message) {
 
 // Send sync request to room (called when joiner's video is ready)
 function sendSyncRequest() {
-  if (!ws || ws.readyState !== WebSocket.OPEN || !currentRoom) {
-    console.log("[Sync] Cannot send sync-request: not connected");
+  if (!currentRoom) return;
+  
+  const payload = { type: "sync-request", ts: Date.now() };
+  
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    console.log("[Sync] Cannot send sync-request: not connected, queueing");
+    pendingSyncRequest = true;
+    queueMessage(payload, "sync-request");
     return;
   }
   
   console.log("[Sync] Sending sync-request to room (pendingSyncRequest=" + pendingSyncRequest + ")");
   pendingSyncRequest = true;
   syncRequestTimestamp = Date.now();
-  ws.send(JSON.stringify({ type: "sync-request" }));
+  
+  // Send encrypted sync request
+  sendEncryptedPayload(payload).then((sent) => {
+    if (sent) return;
+    if (!encryptionRequired) {
+      // Fallback to plaintext if encryption not required and no peers
+      ws.send(JSON.stringify({ type: "sync-request" }));
+      return;
+    }
+    
+    // Encryption required but no peer keys yet - queue for later
+    console.log("[Sync] No peer keys yet, queueing sync-request");
+    queueMessage(payload);
+    // Re-announce keys to fetch peers sooner
+    announceKeyExchange();
+  });
   
   // Set timeout for sync response
   setTimeout(() => {
@@ -968,23 +1127,60 @@ function respondToSyncRequest(requesterName) {
       setTimeout(() => { hasRespondedToSync = false; }, 2000); // Reset after 2s
       
       console.log(`[Sync] Responding to ${requesterName} with state: t=${response.t}`);
-      ws.send(JSON.stringify({
+      
+      // Send encrypted sync state
+      const payload = {
         type: "sync-state",
         time: response.t,
         paused: response.paused,
         url: response.url,
-      }));
+        ts: Date.now(),
+      };
+      
+      sendEncryptedPayload(payload).then((sent) => {
+        if (sent) return;
+        if (!encryptionRequired) {
+          // Fallback to plaintext if encryption not required and no peers
+          ws.send(JSON.stringify({
+            type: "sync-state",
+            time: response.t,
+            paused: response.paused,
+            url: response.url,
+          }));
+          return;
+        }
+        
+        console.log("[Sync] No peer keys yet, queueing sync-state response");
+        queueMessage(payload);
+        announceKeyExchange();
+      });
     });
   });
 }
 
 function forwardState(payload) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    // Queue the latest state so it can be sent once we reconnect
+    lastOutboundState = payload;
+    queueMessage({ type: "state", payload });
+    return;
+  }
+  lastOutboundState = payload;
   emitPlaybackSystem(payload);
+  
+  // Always try to encrypt playback state
   sendEncryptedPayload({ type: "state", payload }).then((sent) => {
-    if (!sent && !encryptionRequired) {
+    if (sent) return;
+    if (!encryptionRequired) {
+      // Room doesn't require encryption, send plaintext
       ws.send(JSON.stringify({ type: "state", payload }));
+      return;
     }
+    
+    // Encryption required but no peer keys yet - queue for later and prompt key exchange
+    console.log("[Sync] Queueing state update - no peer keys yet");
+    queueMessage({ type: "state", payload });
+    announceKeyExchange();
   });
 }
 
@@ -998,20 +1194,25 @@ function sendCurrentStateToRoom() {
     chrome.tabs.sendMessage(tabs[0].id, { type: "get-video-state" }, (response) => {
       if (chrome.runtime.lastError || !response) return;
       
-      const payload = {
+      const statePayload = {
         t: response.t,
         paused: response.paused,
         url: response.url,
         reason: "sync",
         ts: Date.now(),
       };
+      lastOutboundState = statePayload;
       
-      console.log("[Flixers] Sending state to sync new joiner:", payload.t);
+      console.log("[Flixers] Sending state to sync new joiner:", statePayload.t);
       
-      // Send as plaintext state message for immediate sync
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: "state", payload }));
-      }
+      // Send encrypted state message
+      const encryptedPayload = { type: "state", payload: statePayload };
+      sendEncryptedPayload(encryptedPayload).then((sent) => {
+        if (!sent && !encryptionRequired && ws && ws.readyState === WebSocket.OPEN) {
+          // Fallback to plaintext if encryption not required and no peers
+          ws.send(JSON.stringify({ type: "state", payload: statePayload }));
+        }
+      });
     });
   });
 }
@@ -1049,13 +1250,92 @@ function sendChat(text) {
   });
 }
 
+function sendSystemMessage(text) {
+  if (!text || !currentRoom) return;
+  const payload = { type: "system", text, ts: Date.now() };
+  // If not connected, queue the message once
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    queueMessage(payload, "system");
+    return;
+  }
+  sendEncryptedPayload(payload).then((sent) => {
+    if (sent) return;
+    if (!encryptionRequired && ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(payload));
+      return;
+    }
+    queueMessage(payload, "system");
+    announceKeyExchange();
+  });
+}
+
+// Send a single state snapshot immediately (used on reconnect to re-sync peers)
+function sendStateSnapshot(payload) {
+  if (!payload || !currentRoom) return;
+  const envelope = { type: "state", payload: { ...payload, reason: payload.reason || "resync" } };
+  sendEncryptedPayload(envelope).then((sent) => {
+    if (sent) return;
+    if (!encryptionRequired && ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(envelope));
+      return;
+    }
+    queueMessage(envelope, "state-resync");
+    announceKeyExchange();
+  });
+}
+
 // Queue a message for later delivery
-function queueMessage(payload) {
+function queueMessage(payload, dedupeType = null) {
+  if (dedupeType && messageQueue.some((m) => m?.type === dedupeType)) {
+    return;
+  }
   if (messageQueue.length >= MAX_QUEUE_SIZE) {
     // Remove oldest message if queue is full
     messageQueue.shift();
   }
   messageQueue.push(payload);
+  persistQueue(currentRoom);
+}
+
+function persistQueue(roomId) {
+  if (!roomId || !chrome?.storage?.local) return;
+  const key = `${QUEUE_STORAGE_PREFIX}${roomId}`;
+  try {
+    chrome.storage.local.set({ [key]: messageQueue.slice(-MAX_QUEUE_SIZE) }, () => {});
+  } catch (err) {
+    console.warn("[Queue] Failed to persist queue:", err.message);
+  }
+}
+
+function loadPersistedQueue(roomId) {
+  if (!roomId || !chrome?.storage?.local) return Promise.resolve(0);
+  const key = `${QUEUE_STORAGE_PREFIX}${roomId}`;
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.local.get([key], (res) => {
+        const list = Array.isArray(res[key]) ? res[key] : [];
+        if (list.length > 0) {
+          messageQueue.length = 0;
+          list.forEach((m) => messageQueue.push(m));
+          console.log(`[Queue] Restored ${list.length} queued message(s) for room ${roomId}`);
+          resolve(list.length);
+        } else {
+          resolve(0);
+        }
+      });
+    } catch (err) {
+      console.warn("[Queue] Failed to load queue:", err.message);
+      resolve(0);
+    }
+  });
+}
+
+function clearPersistedQueue(roomId) {
+  if (!roomId || !chrome?.storage?.local) return;
+  const key = `${QUEUE_STORAGE_PREFIX}${roomId}`;
+  try {
+    chrome.storage.local.remove([key], () => {});
+  } catch (_) {}
 }
 
 // Flush queued messages when reconnected
@@ -1063,40 +1343,56 @@ function flushMessageQueue() {
   if (messageQueue.length === 0) return;
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   
-  console.log(`[Chat] Flushing ${messageQueue.length} queued messages`);
-  
-  while (messageQueue.length > 0) {
-    const payload = messageQueue.shift();
-    
-    // Send with slight delay to avoid overwhelming
+  const toSend = [...messageQueue];
+  messageQueue.length = 0;
+  console.log(`[Chat] Flushing ${toSend.length} queued messages`);
+
+  let pending = toSend.length;
+  const onComplete = () => {
+    pending -= 1;
+    if (pending === 0 && messageQueue.length === 0) {
+      emitLocalSystem("Queued messages sent");
+      persistQueue(currentRoom);
+    }
+  };
+
+  toSend.forEach((payload, idx) => {
+    const delay = idx * 50;
     setTimeout(() => {
       if (!ws || ws.readyState !== WebSocket.OPEN) {
         // Re-queue if connection lost
         messageQueue.unshift(payload);
+        onComplete();
         return;
       }
-      
+
       sendEncryptedPayload(payload).then((sent) => {
-        if (!sent && !encryptionRequired) {
-          ws.send(JSON.stringify({ 
-            type: "chat", 
-            text: payload.text, 
-            ts: payload.ts, 
-            avatar: payload.avatar 
-          }));
+        if (sent) {
+          onComplete();
+          return;
         }
+        
+        if (!encryptionRequired) {
+          // Room doesn't require encryption, send plaintext
+          ws.send(JSON.stringify(payload));
+          onComplete();
+          return;
+        }
+        
+        // Still no keys for encrypted room - requeue and re-announce
+        console.log("[Chat] Re-queueing payload, still missing peer keys");
+        queueMessage(payload);
+        announceKeyExchange();
+        onComplete();
       });
-    }, messageQueue.length * 50); // Stagger by 50ms each
-  }
-  
-  if (messageQueue.length === 0) {
-    emitLocalSystem("Queued messages sent");
-  }
+    }, delay);
+  });
 }
 
 // Clear message queue (when joining new room)
-function clearMessageQueue() {
+function clearMessageQueue(persist = true) {
   messageQueue.length = 0;
+  if (persist) persistQueue(currentRoom);
 }
 
 // Clean up old room messages from local storage
@@ -1229,6 +1525,27 @@ function emitLocalSystem(text) {
   sendToNetflixTabs(sys);
 }
 
+function notifyRoomDeleted(roomId) {
+  if (!roomId) return;
+  broadcastPopup({ type: "room-deleted", roomId });
+  sendToNetflixTabs({ type: "room-deleted", roomId });
+}
+
+function leaveCurrentRoom(reason = "Left room") {
+  if (!currentRoom) return;
+  emitLocalSystem(reason);
+  persistQueue(currentRoom);
+  clearPersistedKeys(currentRoom);
+  teardownSocket(false, true); // Clear keys and reset attempts
+  const leftRoom = currentRoom;
+  currentRoom = null;
+  connectionStatus = "disconnected";
+  broadcastPopup({ type: "ws-status", status: "disconnected" });
+  sendToNetflixTabs({ type: "ws-status", status: "disconnected" });
+  sendToNetflixTabs({ type: "room-update", roomId: null, name: displayName });
+  console.log(`[Room] Auto-left room ${leftRoom}: ${reason}`);
+}
+
 function formatTime(seconds = 0) {
   const s = Math.max(0, Math.floor(seconds));
   const m = Math.floor(s / 60);
@@ -1289,7 +1606,8 @@ function sendToNetflixTabs(msg) {
 
 function updatePlayerStatus(present, playing, url) {
   hasNetflixPlayer = !!present;
-  hasActivePlayback = !!url && url.includes("netflix.com/watch");
+  const onWatchPage = !!url && url.includes("netflix.com/watch");
+  hasActivePlayback = !!playing || onWatchPage; // allow paused video on watch page
   if (url) {
     lastVideoUrl = url;
   }
@@ -1300,6 +1618,49 @@ function updatePlayerStatus(present, playing, url) {
     url: lastVideoUrl,
   });
 }
+
+function handleEpisodeChanged(url) {
+  if (!currentRoom || !url) return;
+  let path = null;
+  try {
+    path = new URL(url).pathname;
+  } catch (_) {
+    path = url;
+  }
+  if (path && lastEpisodePath === path) return;
+  lastEpisodePath = path;
+  lastVideoUrl = url;
+  const text = "Next episode started playing";
+  emitLocalSystem(text);
+  sendSystemMessage(text);
+  // Notify local Netflix tabs to navigate/sync
+  sendToNetflixTabs({ type: "episode-changed", url });
+  // Broadcast to peers so their tabs can navigate
+  const payload = { type: "episode-changed", url, ts: Date.now(), reason: "resync" };
+  sendEncryptedPayload(payload).then((sent) => {
+    if (sent) return;
+    if (!encryptionRequired && ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(payload));
+      return;
+    }
+    queueMessage(payload, "episode-changed");
+    announceKeyExchange();
+  });
+}
+
+// Force quick health check on tab visibility changes (helps recover after sleep)
+chrome.tabs.onActivated.addListener(() => {
+  lastVisibilityCheck = Date.now();
+  if (currentRoom) {
+    checkConnectionHealth();
+  }
+});
+chrome.windows.onFocusChanged.addListener(() => {
+  lastVisibilityCheck = Date.now();
+  if (currentRoom) {
+    checkConnectionHealth();
+  }
+});
 
 function navigateToVideo(url) {
   if (!url || !url.includes("netflix.com/watch")) return;
@@ -1439,9 +1800,21 @@ handleKeyExchange._persistTimer = null;
 async function handleEncrypted(message) {
   if (message.recipient && message.recipient !== displayName) return;
   if (!message.from) return;
+  
   const peerKey = peerPublicKeys.get(message.from);
   const keyPair = await ensureKeyPair();
-  if (!peerKey || !keyPair) return;
+  
+  if (!peerKey) {
+    console.log(`[Crypto] No key for peer ${message.from}, requesting key exchange`);
+    // Request key exchange from this peer
+    announceKeyExchange();
+    return;
+  }
+  
+  if (!keyPair) {
+    console.warn("[Crypto] No local key pair available");
+    return;
+  }
 
   try {
     const salt = message.salt ? base64ToBuffer(message.salt) : new Uint8Array();
@@ -1449,7 +1822,10 @@ async function handleEncrypted(message) {
     const decrypted = await decryptWithAes(message, aesKey);
     routeDecryptedPayload(decrypted, message.from);
   } catch (err) {
-    // Ignore decrypt failures; message may have targeted another peer.
+    console.warn(`[Crypto] Decrypt failed from ${message.from}:`, err.message);
+    // Message may have targeted another peer, or keys are mismatched
+    // Request fresh key exchange
+    announceKeyExchange();
   }
 }
 
@@ -1475,13 +1851,51 @@ function routeDecryptedPayload(payload, from) {
   }
   if (payload.type === "state") {
     // Forward state updates to content script for sync
-    console.log("[Sync] Received state from", from, "- t:", payload.payload?.t?.toFixed(1), "paused:", payload.payload?.paused);
+    console.log("[Sync] Received encrypted state from", from, "- t:", payload.payload?.t?.toFixed(1), "paused:", payload.payload?.paused);
     sendToNetflixTabs({
       type: "apply-state",
       payload: {
         ...payload.payload,
         reason: "sync",  // Mark as sync so content script applies it
         from,
+      },
+    });
+    return;
+  }
+  
+  // Handle encrypted sync-request (someone is requesting sync state)
+  if (payload.type === "sync-request") {
+    console.log(`[Sync] Received encrypted sync-request from ${from}`);
+    // Only respond if we haven't already (first responder pattern)
+    if (!hasRespondedToSync) {
+      const delay = Math.random() * 500 + 100; // 100-600ms random delay
+      setTimeout(() => respondToSyncRequest(from), delay);
+    }
+    return;
+  }
+  
+  // Handle encrypted sync-state (response to our sync request)
+  if (payload.type === "sync-state") {
+    console.log(`[Sync] Received encrypted sync-state from ${from}: t=${payload.time}, paused=${payload.paused}`);
+    
+    // ONLY apply if we were the one who requested sync (joiner)
+    if (!pendingSyncRequest) {
+      console.log("[Sync] Ignoring encrypted sync-state - we didn't request it");
+      return;
+    }
+    
+    pendingSyncRequest = false;
+    console.log(`[Sync] Applying encrypted sync-state: seeking to ${payload.time}s`);
+    
+    // Apply the sync state to our video (initial sync only)
+    sendToNetflixTabs({
+      type: "apply-state",
+      payload: {
+        t: payload.time,
+        paused: payload.paused,
+        url: payload.url,
+        reason: "sync",
+        ts: payload.ts,
       },
     });
     return;

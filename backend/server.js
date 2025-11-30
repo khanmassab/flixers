@@ -155,8 +155,8 @@ const server = createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws" });
 
 // Connection keepalive configuration
-const PING_INTERVAL = 25000; // Send ping every 25 seconds (matching client)
-const ACTIVITY_TIMEOUT = 60000; // Consider connection dead after 60s of no activity
+const PING_INTERVAL = 15000; // Send ping every 15 seconds (matching client)
+const ACTIVITY_TIMEOUT = 90000; // Consider connection dead after 90s of no activity
 
 // Start server-side ping interval - uses both native ping AND checks activity
 const pingInterval = setInterval(() => {
@@ -250,7 +250,9 @@ wss.on("connection", (socket, req) => {
       
       // Handle pong responses to our server-initiated pings
       if (msg.type === "pong") {
-        // Connection is definitely alive, already tracked via socket.isAlive
+        // CRITICAL: Mark connection as alive when we receive pong
+        socket.isAlive = true;
+        socket.lastActivity = Date.now();
         return;
       }
       
@@ -607,4 +609,3 @@ module.exports = {
   verifySessionToken,
   issueSessionToken,
 };
-

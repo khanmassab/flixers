@@ -69,8 +69,14 @@ document.getElementById("create").addEventListener("click", async () => {
     });
     if (!res.ok) throw new Error("create failed");
     const data = await res.json();
-    roomLinkInput.value = data.roomId;
-    roomLinkInput.value = buildShareLink(data.roomId);
+    const shareLink = buildShareLink(data.roomId);
+    roomLinkInput.value = shareLink;
+    try {
+      await navigator.clipboard.writeText(shareLink);
+      pushToast("Room link copied", "info");
+    } catch (_) {
+      // Clipboard may fail in some contexts; ignore
+    }
     await joinRoom(data.roomId);
     pushToast(`New room created (${data.roomId})`, "info");
   } catch (err) {
