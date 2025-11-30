@@ -156,7 +156,7 @@ const wss = new WebSocketServer({ server, path: "/ws" });
 
 // Connection keepalive configuration
 const PING_INTERVAL = 15000; // Send ping every 15 seconds (matching client)
-const ACTIVITY_TIMEOUT = 90000; // Consider connection dead after 90s of no activity
+const ACTIVITY_TIMEOUT = 7200000; // Consider connection dead after 2 hours of no activity
 
 // Start server-side ping interval - uses both native ping AND checks activity
 const pingInterval = setInterval(() => {
