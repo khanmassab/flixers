@@ -1,5 +1,5 @@
 // Popup logic for Flixers
-const API_BASE = "http://localhost:4000";
+const API_BASE = "http://16.170.150.83";
 const GOOGLE_CLIENT_ID = "400373504190-dasf4eoqp7oqaikurtq9b9gqi32oai6t.apps.googleusercontent.com";
 // chrome.identity.getRedirectURL() respects the runtime ID for this profile, avoiding mismatches.
 const REDIRECT_URI = `https://${chrome.runtime.id}.chromiumapp.org/`;

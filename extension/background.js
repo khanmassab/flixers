@@ -1,5 +1,5 @@
-const BACKEND_HTTP = "http://localhost:4000";
-const BACKEND_WS = "ws://localhost:4000/ws";
+const BACKEND_HTTP = "http://16.170.150.83";
+const BACKEND_WS = "ws://16.170.150.83/ws";
 const GOOGLE_CLIENT_ID = "400373504190-dasf4eoqp7oqaikurtq9b9gqi32oai6t.apps.googleusercontent.com";
 
 let ws;

@@ -15,7 +15,9 @@
   "host_permissions": [
     "*://*.netflix.com/*",
     "http://localhost:4000/*",
-    "https://localhost:4000/*"
+    "https://localhost:4000/*",
+    "http://16.170.150.83/*",
+    "ws://16.170.150.83/*"
   ],
   "content_scripts": [
     {
