@@ -25,9 +25,9 @@
 
 ## End-to-End Encryption
 - Server is a blind relay: it forwards `key-exchange` and `encrypted` payloads and drops plaintext when a room requires encryption.
-- Key exchange example: `{"type":"key-exchange","publicKey":"<base64>","curve":"secp256k1"}` (broadcast to others).
+- Key exchange example: `{"type":"key-exchange","publicKey":"<base64>","curve":"P-256"}` (broadcast to others).
 - Encrypted payload example: `{"type":"encrypted","ciphertext":"<b64>","iv":"<b64>","tag":"<b64>","alg":"aes-256-gcm"}`; server adds `from` and `ts`.
-- Client flow: derive a shared secret with ECDH (e.g., `secp256k1`), HKDF it into an AES-GCM key, encrypt message JSON, send as `encrypted`; decrypt on receipt using the same IV/tag.
+- Client flow: derive a shared secret with ECDH (use `P-256` in WebCrypto / `prime256v1` in Node), HKDF it into an AES-GCM key, encrypt message JSON, send as `encrypted`; decrypt on receipt using the same IV/tag.
 - Optional helper: `client/e2e-crypto.js` exposes `generateKeyPair`, `buildEncryptedEnvelope`, and `openEncryptedEnvelope` to produce payloads ready for the `encrypted` message type.
 
 ## Commit & Pull Request Guidelines

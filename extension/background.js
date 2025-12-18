@@ -5,11 +5,13 @@ const GOOGLE_CLIENT_ID = "400373504190-dasf4eoqp7oqaikurtq9b9gqi32oai6t.apps.goo
 let ws;
 let currentRoom = null;
 let displayName = "Guest";
+let displayId = null; // stable user identity (JWT sub)
 let retryTimer = null;
 let session = null;
 let hasNetflixPlayer = false;
 let encryptionRequired = true;
-const peerPublicKeys = new Map(); // name -> CryptoKey
+const peerPublicKeys = new Map(); // peerId -> CryptoKey
+const peerDisplayNames = new Map(); // peerId -> display name
 let keyPairPromise = null;
 let publicKeyB64 = null;
 let keyPairData = null; // { publicKey, privateKey } raw data for persistence
@@ -20,14 +22,16 @@ const ECDH_CURVE = "P-256";
 // Key persistence settings
 const KEY_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours in milliseconds
 const KEY_STORAGE_PREFIX = "flixers-keys-";
-const seenUsers = new Set();
+const seenUsers = new Set(); // peerId
 let hasActivePlayback = false;
 let lastVideoUrl = null;
+let lastVideoTitle = null;
 let currentParticipants = [];
 let connectionStatus = "idle";
 const playbackState = new Map(); // roomId -> { paused, t }
 let lastOutboundState = null; // Last playback state we sent (for resync after reconnect)
 let lastEpisodePath = null; // Track last episode URL path to avoid duplicate announcements
+let episodeChangeSeq = 0; // Monotonic counter for episode-change events
 
 // Message queue for offline/reconnecting scenarios
 const messageQueue = [];
@@ -103,15 +107,15 @@ async function persistPeerKeys(roomId) {
   
   // Export peer keys to storable format
   const peers = {};
-  for (const [name, cryptoKey] of peerPublicKeys.entries()) {
+  for (const [peerId, cryptoKey] of peerPublicKeys.entries()) {
     try {
       const exported = await crypto.subtle.exportKey("raw", cryptoKey);
-      peers[name] = {
+      peers[peerId] = {
         keyData: bufferToBase64(exported),
         savedAt: Date.now(),
       };
     } catch (err) {
-      console.warn("[Keys] Failed to export peer key for:", name);
+      console.warn("[Keys] Failed to export peer key for:", peerId);
     }
   }
   
@@ -148,8 +152,8 @@ async function loadPersistedPeerKeys(roomId) {
     
     // Import peer keys
     let loaded = 0;
-    for (const [name, peerData] of Object.entries(data.peers || {})) {
-      if (peerPublicKeys.has(name)) continue; // Already have this key
+    for (const [peerId, peerData] of Object.entries(data.peers || {})) {
+      if (peerPublicKeys.has(peerId)) continue; // Already have this key
       
       try {
         const keyBuffer = base64ToBuffer(peerData.keyData);
@@ -160,11 +164,11 @@ async function loadPersistedPeerKeys(roomId) {
           true, // extractable for re-export
           []
         );
-        peerPublicKeys.set(name, cryptoKey);
-        seenUsers.add(name);
+        peerPublicKeys.set(peerId, cryptoKey);
+        seenUsers.add(peerId);
         loaded++;
       } catch (err) {
-        console.warn("[Keys] Failed to import peer key for:", name, err.message);
+        console.warn("[Keys] Failed to import peer key for:", peerId, err.message);
       }
     }
     
@@ -238,6 +242,7 @@ chrome.storage.local.get(["flixersSession"]).then((res) => {
   if (res.flixersSession) {
     session = res.flixersSession;
     displayName = session.profile?.name || "Guest";
+    displayId = session.profile?.sub || null;
   }
 });
 
@@ -282,24 +287,33 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       currentRoom = null;
       lastEpisodePath = null;
       lastVideoUrl = null;
-      sendToNetflixTabs({ type: "room-update", roomId: null, name: displayName });
+      lastVideoTitle = null;
+      sendToNetflixTabs({ type: "room-update", roomId: null, name: displayName, id: displayId });
       sendResponse({ ok: true });
       return true;
     case "player-event":
       forwardState(message.payload);
-      updatePlayerStatus(true, !message.payload?.paused, message.payload?.url);
-      return true;
+      updatePlayerStatus(true, !message.payload?.paused, message.payload?.url, message.payload?.title);
+      sendResponse?.({ ok: true });
+      return false;
     case "chat":
       sendChat(message.text);
-      return true;
+      sendResponse?.({ ok: true });
+      return false;
     case "typing":
       sendTyping(!!message.active);
-      return true;
+      sendResponse?.({ ok: true });
+      return false;
     case "get-room":
-      sendResponse({ roomId: currentRoom, name: displayName });
+      sendResponse({ roomId: currentRoom, name: displayName, id: displayId });
       return true;
     case "get-presence":
-      sendResponse({ users: currentParticipants, roomId: currentRoom, avatars: lastPresenceAvatars });
+      sendResponse({
+        participants: currentParticipants,
+        users: Array.isArray(currentParticipants) ? currentParticipants.map((p) => p?.name).filter(Boolean) : [],
+        roomId: currentRoom,
+        avatars: lastPresenceAvatars,
+      });
       return true;
     case "get-connection-status":
       // When popup/content asks for status, also verify connection is healthy
@@ -331,6 +345,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     case "auth-set":
       session = message.session;
       displayName = session?.profile?.name || "Guest";
+      displayId = session?.profile?.sub || null;
       chrome.storage.local.set({ flixersSession: session || null });
       broadcastPopup({ type: "auth", session });
       sendToNetflixTabs({ type: "auth", session });
@@ -338,6 +353,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     case "auth-clear":
       session = null;
       displayName = "Guest";
+      displayId = null;
       // Clear all keys when signing out
       if (currentRoom) {
         clearPersistedKeys(currentRoom);
@@ -348,6 +364,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       currentRoom = null;
       lastEpisodePath = null;
       lastVideoUrl = null;
+      lastVideoTitle = null;
       chrome.storage.local.remove(["flixersSession"]);
       broadcastPopup({ type: "auth", session: null });
       broadcastPopup({ type: "ws-status", status: "disconnected" });
@@ -357,16 +374,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ session });
       return true;
     case "player-present":
-      updatePlayerStatus(!!message.present, !!message.playing, message.url);
-      return true;
+      updatePlayerStatus(!!message.present, !!message.playing, message.url, message.title);
+      sendResponse?.({ ok: true });
+      return false;
     case "episode-changed":
-      handleEpisodeChanged(message.url);
-      return true;
+      handleEpisodeChanged(message.url, message.ts, message.title);
+      sendResponse?.({ ok: true });
+      return false;
     case "player-status":
       sendResponse({
         present: hasNetflixPlayer,
         playing: hasActivePlayback,
         url: lastVideoUrl,
+        title: lastVideoTitle,
       });
       return true;
     case "request-sync":
@@ -374,7 +394,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       // Force pendingSyncRequest to true for manual resync
       pendingSyncRequest = true;
       sendSyncRequest();
-      return true;
+      sendResponse?.({ ok: true });
+      return false;
     case "show-sync-hint":
       // Show sync hint as a system message in chat
       if (message.diff > 5) {
@@ -383,7 +404,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const targetTimeStr = `${mins}:${secs.toString().padStart(2, "0")}`;
         emitLocalSystem(`📍 Others are at ${targetTimeStr} (${Math.round(message.diff)}s different) - seek manually to sync`);
       }
-      return true;
+      sendResponse?.({ ok: true });
+      return false;
     default:
       return false;
   }
@@ -433,11 +455,12 @@ async function handleJoin(roomId, name, token) {
   
   lastEpisodePath = null;
   lastVideoUrl = null;
+  lastVideoTitle = null;
   currentRoom = roomId;
   await loadPersistedQueue(currentRoom);
   pendingSyncRequest = false;
   hasRespondedToSync = false;
-  sendToNetflixTabs({ type: "room-update", roomId, name: displayName });
+  sendToNetflixTabs({ type: "room-update", roomId, name: displayName, id: displayId });
   connectSocket();
   emitLocalSystem("Joined the room");
   console.log(`[Sync] Joined room ${roomId} as creator/host`);
@@ -494,16 +517,17 @@ async function handleConfirmJoin(roomId, name, token, videoUrl, initialTime) {
   
   lastEpisodePath = null;
   lastVideoUrl = null;
+  lastVideoTitle = null;
   currentRoom = roomId;
   await loadPersistedQueue(currentRoom);
   pendingSyncRequest = true; // Will request sync once connected
   hasRespondedToSync = false;
   
   // Send room-update with retries (content script might not be ready immediately)
-  sendToNetflixTabs({ type: "room-update", roomId, name: displayName });
-  setTimeout(() => sendToNetflixTabs({ type: "room-update", roomId, name: displayName }), 1000);
-  setTimeout(() => sendToNetflixTabs({ type: "room-update", roomId, name: displayName }), 3000);
-  setTimeout(() => sendToNetflixTabs({ type: "room-update", roomId, name: displayName }), 5000);
+  sendToNetflixTabs({ type: "room-update", roomId, name: displayName, id: displayId });
+  setTimeout(() => sendToNetflixTabs({ type: "room-update", roomId, name: displayName, id: displayId }), 1000);
+  setTimeout(() => sendToNetflixTabs({ type: "room-update", roomId, name: displayName, id: displayId }), 3000);
+  setTimeout(() => sendToNetflixTabs({ type: "room-update", roomId, name: displayName, id: displayId }), 5000);
   
   connectSocket();
   emitLocalSystem("Joined the room");
@@ -917,7 +941,7 @@ async function attemptReconnect() {
         currentRoom = null;
         lastEpisodePath = null;
         lastVideoUrl = null;
-        sendToNetflixTabs({ type: "room-update", roomId: null, name: displayName });
+        sendToNetflixTabs({ type: "room-update", roomId: null, name: displayName, id: displayId });
         return;
       }
       console.warn("[WS] Preview check failed, retrying later:", res.status);
@@ -943,6 +967,9 @@ function routeIncoming(message) {
     if (message.payload?.url) {
       lastVideoUrl = message.payload.url;
     }
+    if (message.payload?.title) {
+      lastVideoTitle = message.payload.title;
+    }
     console.log("[Sync] Received state - t:", message.payload?.t?.toFixed(1), "paused:", message.payload?.paused);
     sendToNetflixTabs({
       type: "apply-state",
@@ -954,8 +981,22 @@ function routeIncoming(message) {
     });
   }
   if (message.type === "chat") {
-    broadcastPopup({ type: "chat", from: message.from, text: message.text, ts: message.ts });
-    sendToNetflixTabs({ type: "chat", from: message.from, text: message.text, ts: message.ts });
+    broadcastPopup({
+      type: "chat",
+      from: message.from,
+      fromId: message.fromId,
+      text: message.text,
+      ts: message.ts,
+      avatar: message.avatar || null,
+    });
+    sendToNetflixTabs({
+      type: "chat",
+      from: message.from,
+      fromId: message.fromId,
+      text: message.text,
+      ts: message.ts,
+      avatar: message.avatar || null,
+    });
   }
   if (message.type === "system") {
     const sys = { type: "system", text: message.text, ts: message.ts || Date.now() };
@@ -963,18 +1004,22 @@ function routeIncoming(message) {
     sendToNetflixTabs(sys);
   }
   if (message.type === "presence") {
-    const next = message.users || [];
+    const nextParticipants = Array.isArray(message.participants)
+      ? message.participants.filter((p) => p && p.id)
+      : (message.users || []).map((name) => ({ id: name, name }));
     lastPresenceAvatars = message.avatars || {};
     broadcastPopup({
       type: "presence",
-      users: next,
+      participants: nextParticipants,
+      users: nextParticipants.map((p) => p.name),
       roomId: currentRoom,
       encryptionRequired: message.encryptionRequired,
       avatars: message.avatars || {},
     });
     sendToNetflixTabs({
       type: "presence",
-      users: next,
+      participants: nextParticipants,
+      users: nextParticipants.map((p) => p.name),
       roomId: currentRoom,
       encryptionRequired: message.encryptionRequired,
       avatars: message.avatars || {},
@@ -984,19 +1029,24 @@ function routeIncoming(message) {
     }
     
     // Track participant changes (no system messages - just update count)
-    currentParticipants = next;
+    currentParticipants = nextParticipants;
+    nextParticipants.forEach((p) => {
+      if (!p?.id) return;
+      if (p.name) peerDisplayNames.set(p.id, p.name);
+    });
     
     // DON'T auto-send state when someone joins - they will request sync explicitly
     // This prevents DRM issues from automatic video manipulation
     
     // Announce key exchange for new users
     let announce = false;
-    next.forEach((u) => {
-      if (!u) return;
-      if (!seenUsers.has(u) || !peerPublicKeys.has(u)) {
+    nextParticipants.forEach((p) => {
+      if (!p?.id) return;
+      if (displayId && p.id === displayId) return;
+      if (!seenUsers.has(p.id) || !peerPublicKeys.has(p.id)) {
         announce = true;
       }
-      seenUsers.add(u);
+      seenUsers.add(p.id);
     });
     if (announce) {
       announceKeyExchange();
@@ -1012,6 +1062,7 @@ function routeIncoming(message) {
     const typingMsg = {
       type: "typing",
       from: message.from,
+      fromId: message.fromId,
       active: !!message.active,
       ts: message.ts || Date.now(),
     };
@@ -1019,23 +1070,61 @@ function routeIncoming(message) {
     sendToNetflixTabs(typingMsg);
   }
   if (message.type === "episode-changed") {
-    sendToNetflixTabs({ type: "episode-changed", url: message.url });
+    console.log("[Episode] WS -> episode-changed", {
+      url: message.url,
+      ts: message.ts,
+      seq: message.seq,
+      from: message.from,
+      reason: message.reason,
+    });
+    if (message.url) {
+      lastVideoUrl = message.url;
+      lastVideoTitle = message.title || null;
+      updatePlayerStatus(hasNetflixPlayer, hasActivePlayback, lastVideoUrl, lastVideoTitle);
+    }
+    const episodePayload = {
+      type: "episode-changed",
+      url: message.url,
+      ts: message.ts,
+      from: message.from,
+      fromId: message.fromId,
+      seq: message.seq,
+      reason: message.reason || "resync",
+      title: message.title || null,
+    };
+    sendToNetflixTabs(episodePayload);
+    // Also send an apply-state resync payload to force navigation on peers
+    sendToNetflixTabs({
+      type: "apply-state",
+      payload: {
+        url: message.url,
+        ts: message.ts,
+        from: message.from,
+        fromId: message.fromId,
+        seq: message.seq,
+        reason: "resync",
+      },
+    });
+    // Final guard: navigate the active Netflix tab directly
+    navigateToVideo(message.url);
   }
   
   // Sync handshake: someone is requesting sync state
   if (message.type === "sync-request") {
-    console.log(`[Sync] Received sync-request from ${message.from}`);
+    console.log(`[Sync] Received sync-request from ${message.fromId || message.from}`);
     // Only respond if we haven't already (first responder pattern)
     // Use random delay to avoid multiple peers responding at once
     if (!hasRespondedToSync) {
       const delay = Math.random() * 500 + 100; // 100-600ms random delay
-      setTimeout(() => respondToSyncRequest(message.from), delay);
+      setTimeout(() => respondToSyncRequest(message.fromId || message.from), delay);
     }
   }
   
   // Sync handshake: received sync state from a peer
   if (message.type === "sync-state") {
-    console.log(`[Sync] Received sync-state from ${message.from}: t=${message.time}, paused=${message.paused}`);
+    console.log(
+      `[Sync] Received sync-state from ${message.fromId || message.from}: t=${message.time}, paused=${message.paused}`
+    );
     
     // ONLY apply if we were the one who requested sync (joiner)
     // This prevents existing room members from having their video manipulated
@@ -1106,7 +1195,7 @@ function sendSyncRequest() {
 }
 
 // Respond to sync request with current playback state
-function respondToSyncRequest(requesterName) {
+function respondToSyncRequest(requesterId) {
   if (!ws || ws.readyState !== WebSocket.OPEN || !currentRoom) return;
   if (hasRespondedToSync) return; // Already responded
   
@@ -1126,7 +1215,8 @@ function respondToSyncRequest(requesterName) {
       hasRespondedToSync = true;
       setTimeout(() => { hasRespondedToSync = false; }, 2000); // Reset after 2s
       
-      console.log(`[Sync] Responding to ${requesterName} with state: t=${response.t}`);
+      const requesterLabel = peerDisplayNames.get(requesterId) || requesterId || "peer";
+      console.log(`[Sync] Responding to ${requesterLabel} with state: t=${response.t}`);
       
       // Send encrypted sync state
       const payload = {
@@ -1191,17 +1281,18 @@ function sendCurrentStateToRoom() {
   chrome.tabs.query({ url: "*://*.netflix.com/watch/*" }, (tabs) => {
     if (!tabs || tabs.length === 0) return;
     
-    chrome.tabs.sendMessage(tabs[0].id, { type: "get-video-state" }, (response) => {
-      if (chrome.runtime.lastError || !response) return;
-      
-      const statePayload = {
-        t: response.t,
-        paused: response.paused,
-        url: response.url,
-        reason: "sync",
-        ts: Date.now(),
-      };
-      lastOutboundState = statePayload;
+      chrome.tabs.sendMessage(tabs[0].id, { type: "get-video-state" }, (response) => {
+        if (chrome.runtime.lastError || !response) return;
+        
+        const statePayload = {
+          t: response.t,
+          paused: response.paused,
+          url: response.url,
+          title: response.title,
+          reason: "sync",
+          ts: Date.now(),
+        };
+        lastOutboundState = statePayload;
       
       console.log("[Flixers] Sending state to sync new joiner:", statePayload.t);
       
@@ -1286,14 +1377,23 @@ function sendStateSnapshot(payload) {
 
 // Queue a message for later delivery
 function queueMessage(payload, dedupeType = null) {
-  if (dedupeType && messageQueue.some((m) => m?.type === dedupeType)) {
-    return;
+  if (dedupeType) {
+    for (let i = messageQueue.length - 1; i >= 0; i--) {
+      const existing = messageQueue[i];
+      if (existing?._dedupeType === dedupeType || existing?.type === dedupeType) {
+        messageQueue.splice(i, 1);
+      }
+    }
   }
+  const entry =
+    payload && typeof payload === "object"
+      ? { ...payload, ...(dedupeType ? { _dedupeType: dedupeType } : {}) }
+      : payload;
   if (messageQueue.length >= MAX_QUEUE_SIZE) {
     // Remove oldest message if queue is full
     messageQueue.shift();
   }
-  messageQueue.push(payload);
+  messageQueue.push(entry);
   persistQueue(currentRoom);
 }
 
@@ -1359,6 +1459,15 @@ function flushMessageQueue() {
   toSend.forEach((payload, idx) => {
     const delay = idx * 50;
     setTimeout(() => {
+      const dedupeKey = payload?._dedupeType || payload?.type || null;
+      const outbound =
+        payload && typeof payload === "object"
+          ? (() => {
+              const { _dedupeType, ...rest } = payload;
+              return rest;
+            })()
+          : payload;
+
       if (!ws || ws.readyState !== WebSocket.OPEN) {
         // Re-queue if connection lost
         messageQueue.unshift(payload);
@@ -1366,7 +1475,25 @@ function flushMessageQueue() {
         return;
       }
 
-      sendEncryptedPayload(payload).then((sent) => {
+      // Some event types are intentionally always plaintext for reliability,
+      // even if the room requires encryption.
+      if (payload?.type === "system") {
+        try {
+          ws.send(JSON.stringify(outbound));
+        } catch (_) {
+          queueMessage(payload, dedupeKey || payload?.type);
+        }
+        onComplete();
+        return;
+      }
+
+      if (payload?.type === "episode-changed") {
+        // Use the same encrypted-first logic as live sending
+        sendEpisodeChanged(outbound).then(() => onComplete());
+        return;
+      }
+
+      sendEncryptedPayload(outbound).then((sent) => {
         if (sent) {
           onComplete();
           return;
@@ -1374,14 +1501,14 @@ function flushMessageQueue() {
         
         if (!encryptionRequired) {
           // Room doesn't require encryption, send plaintext
-          ws.send(JSON.stringify(payload));
+          ws.send(JSON.stringify(outbound));
           onComplete();
           return;
         }
         
         // Still no keys for encrypted room - requeue and re-announce
         console.log("[Chat] Re-queueing payload, still missing peer keys");
-        queueMessage(payload);
+        queueMessage(payload, dedupeKey);
         announceKeyExchange();
         onComplete();
       });
@@ -1478,9 +1605,10 @@ function sendTyping(active) {
   });
 }
 
-function sendSystem(text) {
-  if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
-  const payload = { type: "system", text, ts: Date.now() };
+function sendSystem(textOrPayload) {
+  if (!textOrPayload || !ws || ws.readyState !== WebSocket.OPEN) return;
+  const base = typeof textOrPayload === "string" ? { text: textOrPayload } : textOrPayload;
+  const payload = { type: "system", ts: Date.now(), ...base };
   // System messages (play/pause/skip notifications) are always sent as plaintext
   // since they're not sensitive and need to be reliably delivered to all participants
   // regardless of encryption key exchange status
@@ -1493,6 +1621,8 @@ function emitPlaybackSystem(payload = {}) {
   const next = {
     paused: payload.paused,
     t: typeof payload.t === "number" ? payload.t : prev.t,
+    title: payload.title || prev.title,
+    url: payload.url || prev.url,
   };
   playbackState.set(currentRoom, next);
   if (payload.reason === "time") return;
@@ -1500,7 +1630,10 @@ function emitPlaybackSystem(payload = {}) {
   
   // Detect play/pause changes
   if (typeof payload.paused === "boolean" && payload.paused !== prev.paused) {
-    changes.push(payload.paused ? `${displayName} paused` : `${displayName} started playing`);
+    const text = payload.paused
+      ? `${displayName} paused`
+      : `${displayName} started playing`;
+    changes.push({ text });
   }
   
   // Detect significant seeks (> 3 seconds)
@@ -1509,18 +1642,21 @@ function emitPlaybackSystem(payload = {}) {
     typeof prev.t === "number" &&
     Math.abs(payload.t - prev.t) > 3
   ) {
-    changes.push(`${displayName} skipped to ${formatTime(payload.t)}`);
+    const text = `${displayName} skipped to ${formatTime(payload.t)}`;
+    changes.push({ text });
   }
   
   // Emit locally and broadcast to room
-  changes.forEach((text) => {
-    emitLocalSystem(text);
-    sendSystem(text);
+  changes.forEach((change) => {
+    emitLocalSystem(change);
+    sendSystem(change);
   });
 }
 
-function emitLocalSystem(text) {
-  const sys = { type: "system", text, ts: Date.now() };
+function emitLocalSystem(textOrPayload) {
+  if (!textOrPayload) return;
+  const base = typeof textOrPayload === "string" ? { text: textOrPayload } : textOrPayload;
+  const sys = { type: "system", ts: Date.now(), ...base };
   broadcastPopup(sys);
   sendToNetflixTabs(sys);
 }
@@ -1542,7 +1678,7 @@ function leaveCurrentRoom(reason = "Left room") {
   connectionStatus = "disconnected";
   broadcastPopup({ type: "ws-status", status: "disconnected" });
   sendToNetflixTabs({ type: "ws-status", status: "disconnected" });
-  sendToNetflixTabs({ type: "room-update", roomId: null, name: displayName });
+  sendToNetflixTabs({ type: "room-update", roomId: null, name: displayName, id: displayId });
   console.log(`[Room] Auto-left room ${leftRoom}: ${reason}`);
 }
 
@@ -1604,48 +1740,99 @@ function sendToNetflixTabs(msg) {
     .catch(() => {});
 }
 
-function updatePlayerStatus(present, playing, url) {
+function updatePlayerStatus(present, playing, url, title) {
   hasNetflixPlayer = !!present;
   const onWatchPage = !!url && url.includes("netflix.com/watch");
   hasActivePlayback = !!playing || onWatchPage; // allow paused video on watch page
   if (url) {
     lastVideoUrl = url;
   }
+  if (title) {
+    lastVideoTitle = title;
+  }
   broadcastPopup({
     type: "player-present",
     present: hasNetflixPlayer,
     playing: hasActivePlayback,
     url: lastVideoUrl,
+    title: lastVideoTitle,
   });
 }
 
-function handleEpisodeChanged(url) {
+function handleEpisodeChanged(url, ts, title) {
   if (!currentRoom || !url) return;
+  const timestamp = typeof ts === "number" ? ts : Date.now();
   let path = null;
   try {
     path = new URL(url).pathname;
   } catch (_) {
     path = url;
   }
-  if (path && lastEpisodePath === path) return;
-  lastEpisodePath = path;
+  const isSamePath = !!path && lastEpisodePath === path;
+  const prevTitle = lastVideoTitle;
+  // Always keep the latest full URL (query params may change even if the watch id is the same).
   lastVideoUrl = url;
-  const text = "Next episode started playing";
-  emitLocalSystem(text);
-  sendSystemMessage(text);
-  // Notify local Netflix tabs to navigate/sync
-  sendToNetflixTabs({ type: "episode-changed", url });
-  // Broadcast to peers so their tabs can navigate
-  const payload = { type: "episode-changed", url, ts: Date.now(), reason: "resync" };
-  sendEncryptedPayload(payload).then((sent) => {
-    if (sent) return;
-    if (!encryptionRequired && ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(payload));
-      return;
+  
+  // If we're still on the same /watch path, treat this as a title update (no system message).
+  if (isSamePath) {
+    if (title && title !== lastVideoTitle) {
+      console.log("[Episode] Updating episode title", { url, ts: timestamp, path, title });
+      lastVideoTitle = title;
+      updatePlayerStatus(hasNetflixPlayer, hasActivePlayback, lastVideoUrl, lastVideoTitle);
+      // Re-broadcast so peers can auto-load and update Now Playing once the title is known.
+	      const payload = {
+	        type: "episode-changed",
+	        url,
+	        ts: timestamp,
+	        seq: ++episodeChangeSeq,
+	        from: displayName,
+	        fromId: displayId,
+	        reason: "resync",
+	        title,
+	      };
+      sendEpisodeChanged(payload);
     }
-    queueMessage(payload, "episode-changed");
-    announceKeyExchange();
-  });
+    return;
+  }
+  
+  const seq = ++episodeChangeSeq;
+  console.log("[Episode] Announcing episode change", { url, ts: timestamp, seq, path, title });
+  lastEpisodePath = path;
+  // Title at navigation time is often stale (previous episode). Accept it only if it differs
+  // from what we were showing before; otherwise clear until the new title is detected.
+  const safeTitle = title && title !== prevTitle ? title : null;
+  lastVideoTitle = safeTitle;
+  updatePlayerStatus(hasNetflixPlayer, hasActivePlayback, lastVideoUrl, lastVideoTitle);
+  const text = `${displayName} started the next episode`;
+  const sysPayload = { text, url };
+  emitLocalSystem(sysPayload);
+  // Broadcast as a system message (always plaintext) so it reliably reaches everyone.
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    sendSystem(sysPayload);
+  } else {
+    queueMessage({ type: "system", text, url, ts: timestamp }, "system");
+  }
+  // Notify local Netflix tabs to navigate/sync
+	  const payload = {
+	    type: "episode-changed",
+	    url,
+	    ts: timestamp,
+	    seq,
+	    from: displayName,
+	    fromId: displayId,
+	    reason: "resync",
+	    title: safeTitle,
+	  };
+  sendToNetflixTabs(payload);
+  // Force navigation locally as well via apply-state to avoid missing episode-changed handlers
+	  sendToNetflixTabs({
+	    type: "apply-state",
+	    payload: { url, ts: timestamp, seq, from: displayName, fromId: displayId, reason: "resync" },
+	  });
+  // As a final guard, navigate the active Netflix tab directly
+  navigateToVideo(url);
+  // Broadcast to peers so their tabs can navigate (encrypted first for encrypted rooms)
+  sendEpisodeChanged(payload);
 }
 
 // Force quick health check on tab visibility changes (helps recover after sleep)
@@ -1664,6 +1851,7 @@ chrome.windows.onFocusChanged.addListener(() => {
 
 function navigateToVideo(url) {
   if (!url || !url.includes("netflix.com/watch")) return;
+  console.log("[Episode] navigateToVideo", url);
   chrome.tabs
     .query({ url: "*://*.netflix.com/*" })
     .then((tabs) => {
@@ -1673,10 +1861,51 @@ function navigateToVideo(url) {
       }
       const [first] = tabs;
       if (first && first.id) {
-        chrome.tabs.update(first.id, { url });
+        chrome.tabs.update(first.id, { url }).catch(() => {
+          // Fallback: force navigation via scripting in case update is blocked
+          try {
+            chrome.scripting.executeScript({
+              target: { tabId: first.id, allFrames: true },
+              func: (nextUrl) => {
+                try {
+                  if (window.location.href !== nextUrl) {
+                    window.location.href = nextUrl;
+                  }
+                } catch (_) {}
+              },
+              args: [url],
+            });
+          } catch (_) {}
+        });
       }
     })
     .catch(() => {});
+}
+
+async function sendEpisodeChanged(payload) {
+  if (!payload || !payload.url) return;
+  // Try encrypted delivery first when encryption is required
+  if (encryptionRequired && ws && ws.readyState === WebSocket.OPEN) {
+    const sent = await sendEncryptedPayload(payload);
+    if (sent) {
+      return;
+    }
+    // No keys yet, queue and re-announce exchange
+    queueMessage(payload, "episode-changed");
+    announceKeyExchange();
+    return;
+  }
+  
+  // Plaintext path (non-encrypted rooms)
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    try {
+      ws.send(JSON.stringify(payload));
+      return;
+    } catch (_) {
+      // fall through to queue
+    }
+  }
+  queueMessage(payload, "episode-changed");
 }
 
 async function announceKeyExchange() {
@@ -1760,7 +1989,9 @@ async function ensureKeyPair() {
 }
 
 async function handleKeyExchange(message) {
-  if (!message?.publicKey || !message.from || message.from === displayName) return;
+  const peerId = message?.fromId || message?.from;
+  if (!message?.publicKey || !peerId) return;
+  if (displayId && peerId === displayId) return;
   
   const hadNoPeers = peerPublicKeys.size === 0;
   
@@ -1772,8 +2003,11 @@ async function handleKeyExchange(message) {
       true, // extractable so we can persist
       []
     );
-    peerPublicKeys.set(message.from, key);
-    console.log("[Keys] Received and stored key from:", message.from);
+    peerPublicKeys.set(peerId, key);
+    if (message.from) {
+      peerDisplayNames.set(peerId, message.from);
+    }
+    console.log("[Keys] Received and stored key from:", message.from || peerId);
     
     // Persist peer keys after update
     if (currentRoom) {
@@ -1798,14 +2032,16 @@ async function handleKeyExchange(message) {
 handleKeyExchange._persistTimer = null;
 
 async function handleEncrypted(message) {
-  if (message.recipient && message.recipient !== displayName) return;
-  if (!message.from) return;
+  const recipientId = message.recipientId || message.recipient;
+  if (recipientId && displayId && recipientId !== displayId) return;
+  const senderId = message.fromId || message.from;
+  if (!senderId) return;
   
-  const peerKey = peerPublicKeys.get(message.from);
+  const peerKey = peerPublicKeys.get(senderId);
   const keyPair = await ensureKeyPair();
   
   if (!peerKey) {
-    console.log(`[Crypto] No key for peer ${message.from}, requesting key exchange`);
+    console.log(`[Crypto] No key for peer ${senderId}, requesting key exchange`);
     // Request key exchange from this peer
     announceKeyExchange();
     return;
@@ -1820,21 +2056,22 @@ async function handleEncrypted(message) {
     const salt = message.salt ? base64ToBuffer(message.salt) : new Uint8Array();
     const aesKey = await deriveAesKeyFromPeer(keyPair.privateKey, peerKey, salt);
     const decrypted = await decryptWithAes(message, aesKey);
-    routeDecryptedPayload(decrypted, message.from);
+    routeDecryptedPayload(decrypted, senderId, message.from || peerDisplayNames.get(senderId) || senderId);
   } catch (err) {
-    console.warn(`[Crypto] Decrypt failed from ${message.from}:`, err.message);
+    console.warn(`[Crypto] Decrypt failed from ${senderId}:`, err.message);
     // Message may have targeted another peer, or keys are mismatched
     // Request fresh key exchange
     announceKeyExchange();
   }
 }
 
-function routeDecryptedPayload(payload, from) {
+function routeDecryptedPayload(payload, fromId, fromName) {
   if (!payload || typeof payload !== "object") return;
   if (payload.type === "chat") {
     const msg = {
       type: "chat",
-      from,
+      from: fromName || "Anon",
+      fromId,
       text: payload.text,
       ts: payload.ts || Date.now(),
       avatar: payload.avatar,
@@ -1844,39 +2081,85 @@ function routeDecryptedPayload(payload, from) {
     return;
   }
   if (payload.type === "typing") {
-    const typingMsg = { type: "typing", from, active: !!payload.active, ts: payload.ts || Date.now() };
+    const typingMsg = {
+      type: "typing",
+      from: fromName,
+      fromId,
+      active: !!payload.active,
+      ts: payload.ts || Date.now(),
+    };
     broadcastPopup(typingMsg);
     sendToNetflixTabs(typingMsg);
     return;
   }
   if (payload.type === "state") {
+    if (payload.payload?.url) {
+      lastVideoUrl = payload.payload.url;
+    }
+    if (payload.payload?.title) {
+      lastVideoTitle = payload.payload.title;
+    }
+    updatePlayerStatus(
+      hasNetflixPlayer,
+      typeof payload.payload?.paused === "boolean" ? !payload.payload.paused : hasActivePlayback,
+      lastVideoUrl,
+      lastVideoTitle
+    );
     // Forward state updates to content script for sync
-    console.log("[Sync] Received encrypted state from", from, "- t:", payload.payload?.t?.toFixed(1), "paused:", payload.payload?.paused);
+    console.log("[Sync] Received encrypted state from", fromName || fromId, "- t:", payload.payload?.t?.toFixed(1), "paused:", payload.payload?.paused);
     sendToNetflixTabs({
       type: "apply-state",
       payload: {
         ...payload.payload,
         reason: "sync",  // Mark as sync so content script applies it
-        from,
+        from: fromName,
+        fromId,
       },
     });
+    return;
+  }
+
+  if (payload.type === "episode-changed") {
+    const url = payload.url;
+    if (url) {
+      lastVideoUrl = url;
+      // Use title if provided (content script re-sends once the new title is detected),
+      // otherwise clear to avoid showing the previous episode's title.
+      lastVideoTitle = payload.title || null;
+      updatePlayerStatus(hasNetflixPlayer, hasActivePlayback, lastVideoUrl, lastVideoTitle);
+    }
+    sendToNetflixTabs({
+      type: "episode-changed",
+      url: payload.url,
+      ts: payload.ts,
+      from: fromName,
+      fromId,
+      seq: payload.seq,
+      reason: payload.reason || "resync",
+      title: payload.title || null,
+    });
+    sendToNetflixTabs({
+      type: "apply-state",
+      payload: { url: payload.url, ts: payload.ts, from: fromName, fromId, seq: payload.seq, reason: "resync" },
+    });
+    navigateToVideo(payload.url);
     return;
   }
   
   // Handle encrypted sync-request (someone is requesting sync state)
   if (payload.type === "sync-request") {
-    console.log(`[Sync] Received encrypted sync-request from ${from}`);
+    console.log(`[Sync] Received encrypted sync-request from ${fromName || fromId}`);
     // Only respond if we haven't already (first responder pattern)
     if (!hasRespondedToSync) {
       const delay = Math.random() * 500 + 100; // 100-600ms random delay
-      setTimeout(() => respondToSyncRequest(from), delay);
+      setTimeout(() => respondToSyncRequest(fromId), delay);
     }
     return;
   }
   
   // Handle encrypted sync-state (response to our sync request)
   if (payload.type === "sync-state") {
-    console.log(`[Sync] Received encrypted sync-state from ${from}: t=${payload.time}, paused=${payload.paused}`);
+    console.log(`[Sync] Received encrypted sync-state from ${fromName || fromId}: t=${payload.time}, paused=${payload.paused}`);
     
     // ONLY apply if we were the one who requested sync (joiner)
     if (!pendingSyncRequest) {
@@ -1927,7 +2210,7 @@ async function sendEncryptedPayload(payload) {
           tag,
           salt: bufferToBase64(salt),
           alg: "aes-256-gcm",
-          recipient: peer,
+          recipientId: peer,
         })
       );
     })
@@ -2078,6 +2361,7 @@ async function handleGoogleSignIn() {
     // Save session
     session = newSession;
     displayName = session.profile?.name || "Guest";
+    displayId = session.profile?.sub || null;
     await chrome.storage.local.set({ flixersSession: newSession });
     
     // Notify popup and content scripts

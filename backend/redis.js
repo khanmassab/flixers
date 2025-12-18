@@ -1,4 +1,5 @@
 const Redis = require("ioredis");
+const { ROOM_TTL_SECONDS } = require("./roomLifecycle");
 
 const REDIS_URL = process.env.REDIS_URL || "redis://localhost:6379";
 
@@ -40,8 +41,20 @@ const CACHE_TTL = {
   USER: 300,           // 5 minutes
   PREFERENCES: 300,    // 5 minutes
   FRIENDS: 60,         // 1 minute
-  ROOM: 86400,         // 1 day (24 hours)
+  ROOM: ROOM_TTL_SECONDS,
 };
+
+async function touchRoomKeys(roomId, ttlSeconds = CACHE_TTL.ROOM) {
+  if (!roomId) return;
+  try {
+    const pipeline = redis.pipeline();
+    pipeline.expire(`room:${roomId}`, ttlSeconds);
+    pipeline.expire(`room:${roomId}:users`, ttlSeconds);
+    await pipeline.exec();
+  } catch (err) {
+    console.warn("[Redis] Touch room keys error:", err.message);
+  }
+}
 
 /**
  * Get cached value, or fetch and cache if not exists
@@ -153,17 +166,23 @@ async function invalidateAllSessions(userId) {
  */
 async function createRoom(roomId, options = {}) {
   const roomKey = `room:${roomId}`;
+  const videoTime =
+    typeof options.videoTime === "number"
+      ? options.videoTime
+      : typeof options.initialTime === "number"
+        ? options.initialTime
+        : parseFloat(options.videoTime ?? options.initialTime ?? 0) || 0;
   const roomData = {
     id: roomId,
     encryptionRequired: options.encryptionRequired || false,
     videoUrl: options.videoUrl || "",
-    videoTime: options.videoTime || 0,
+    videoTime,
     createdAt: Date.now(),
   };
   
   try {
     await redis.hset(roomKey, roomData);
-    await redis.expire(roomKey, CACHE_TTL.ROOM);
+    await touchRoomKeys(roomId);
   } catch (err) {
     console.warn("[Redis] Create room error:", err.message);
   }
@@ -178,6 +197,7 @@ async function updateRoomVideoState(roomId, videoUrl, videoTime) {
   const roomKey = `room:${roomId}`;
   try {
     await redis.hset(roomKey, { videoUrl: videoUrl || "", videoTime: videoTime || 0 });
+    await touchRoomKeys(roomId);
   } catch (err) {
     console.warn("[Redis] Update room video state error:", err.message);
   }
@@ -212,7 +232,7 @@ async function addUserToRoom(roomId, userId, userName) {
   const userKey = `room:${roomId}:users`;
   try {
     await redis.hset(userKey, userId, JSON.stringify({ name: userName, joinedAt: Date.now() }));
-    await redis.expire(userKey, CACHE_TTL.ROOM);
+    await touchRoomKeys(roomId);
   } catch (err) {
     console.warn("[Redis] Add user to room error:", err.message);
   }
@@ -224,14 +244,9 @@ async function addUserToRoom(roomId, userId, userName) {
 async function removeUserFromRoom(roomId, userId) {
   try {
     await redis.hdel(`room:${roomId}:users`, userId);
-    
-    // Check if room is empty
-    const users = await redis.hlen(`room:${roomId}:users`);
-    if (users === 0) {
-      // Clean up empty room after delay
-      await redis.expire(`room:${roomId}`, 60);
-      await redis.expire(`room:${roomId}:users`, 60);
-    }
+
+    // Keep room keys around for the same TTL when the room becomes empty.
+    await touchRoomKeys(roomId);
   } catch (err) {
     console.warn("[Redis] Remove user from room error:", err.message);
   }
@@ -501,4 +516,3 @@ module.exports = {
   disconnect,
   isRedisConnected,
 };
-

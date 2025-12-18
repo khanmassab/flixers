@@ -27,7 +27,11 @@ function safeSend(message, callback) {
   try {
     chrome.runtime.sendMessage(message, (response) => {
       if (chrome.runtime.lastError) {
-        extensionContextValid = false;
+        const msg = chrome.runtime.lastError?.message || "";
+        // Treat only actual invalidation as fatal; transient "no response" can happen during SW restarts.
+        if (/Extension context invalidated/i.test(msg)) {
+          extensionContextValid = false;
+        }
         return;
       }
       if (callback) callback(response);
@@ -46,6 +50,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         t: video.currentTime,
         paused: video.paused,
         url: window.location.href,
+        title: NetflixAdapter.getTitle ? NetflixAdapter.getTitle() : null,
       });
     } else {
       sendResponse(null);
@@ -420,7 +425,65 @@ const NetflixAdapter = (() => {
       duration: v.duration,
       rate: v.playbackRate,
       url: window.location.href,
+      title: getTitle(),
     };
+  };
+
+  // Try to read the title from Netflix UI
+  const getTitle = () => {
+    try {
+      const normalizeTitle = (raw) => {
+        if (!raw) return null;
+        let t = raw.replace(/\s+/g, " ").trim();
+        t = t.replace(/([A-Za-z])([0-9])/g, "$1 $2");
+        t = t.replace(/([0-9])([A-Za-z])/g, "$1 $2");
+        t = t.replace(/:\s*/g, ": ");
+        // Normalize season/episode tokens: collapse internal spaces then pad with spaces around them
+        t = t.replace(/([SsEe])\s+(\d+)/g, "$1$2"); // E 5 -> E5
+        t = t.replace(/(Ep)\s+(\d+)/gi, "$1$2");
+        t = t.replace(/([A-Za-z])([SsEe](?:p)?\d+)/g, "$1 $2"); // Stranger ThingsE5 -> Stranger Things E5
+        t = t.replace(/([SsEe](?:p)?\d+)([A-Za-z])/g, "$1 $2"); // E5Chapter -> E5 Chapter
+        if (/^netflix$/i.test(t)) return null;
+        return t;
+      };
+
+      const selectors = [
+        '[data-uia="video-title"]',
+        '.video-title',
+        '.ellipsize-text',
+        '.PlayerControlsNeo__button-control-row .text-title', // fallback
+        'title',
+      ];
+      // Preferred: explicit Netflix UI labels
+      for (const sel of selectors) {
+        const el = document.querySelector(sel);
+        if (el) {
+          const text = (el.textContent || "").trim();
+          const normalized = normalizeTitle(text);
+          if (normalized) return normalized;
+        }
+      }
+      // Next: social meta tags (often contain full title)
+      const metaCandidates = [
+        'meta[property="og:title"]',
+        'meta[name="og:title"]',
+        'meta[name="twitter:title"]',
+      ];
+      for (const sel of metaCandidates) {
+        const meta = document.querySelector(sel);
+        const text = (meta?.content || "").trim();
+        const normalized = normalizeTitle(text && text.replace(/ - Netflix$/i, "").trim());
+        if (normalized) {
+          return normalized;
+        }
+      }
+      // Fallback: document title
+      const docTitle = normalizeTitle((document.title || "").replace(/ - Netflix$/i, "").trim());
+      if (docTitle) return docTitle;
+      return null;
+    } catch (_) {
+      return null;
+    }
   };
 
   // Seek using Netflix's internal API (preferred) or scrubber interaction (fallback)
@@ -745,6 +808,7 @@ const NetflixAdapter = (() => {
     isReady,
     invalidateCache,
     wireListeners,
+    getTitle,
   };
 })();
 
@@ -759,8 +823,12 @@ const PlayerSync = (() => {
   let eventsWired = false;
   let syncRequestSent = false;
   let lastEpisodePath = null;
+  let lastEpisodeChangeTs = 0;
+  const lastEpisodeSeqBySender = new Map();
   let lastSyncTargetPath = null;
   let pendingNavigationTarget = null;
+  let titleRetryTimer = null;
+  let titleRetryTargetPath = null;
   let lastDriftWarning = 0;
   let pollInterval = null;
 
@@ -783,6 +851,16 @@ const PlayerSync = (() => {
       wiredVideoElement = null;
       eventsWired = false;
       syncRequestSent = false;
+      lastEpisodePath = null;
+      lastEpisodeChangeTs = 0;
+      lastEpisodeSeqBySender.clear();
+      lastSyncTargetPath = null;
+      pendingNavigationTarget = null;
+      if (titleRetryTimer) {
+        clearInterval(titleRetryTimer);
+        titleRetryTimer = null;
+        titleRetryTargetPath = null;
+      }
       stopPolling();
       // Disconnect observer
       if (observer) {
@@ -799,6 +877,7 @@ const PlayerSync = (() => {
     if (pollInterval) return;
     pollInterval = setInterval(() => {
       if (!isInRoom) return;
+      announceEpisodeIfChanged();
       const v = getVideo();
       if (v && v !== wiredVideoElement) {
         console.log("[Flixers] Poll detected new video element");
@@ -872,21 +951,22 @@ const PlayerSync = (() => {
       present: true,
       playing: !video.paused,
       url: window.location.href,
+      title: NetflixAdapter.getTitle ? NetflixAdapter.getTitle() : null,
     });
   };
   
   // Request sync state from other peers (for joiners)
-  const requestSyncIfNeeded = (delayMs = 1500) => {
-    if (!isInRoom || !video || syncRequestSent) return;
-    
-    // Wait a moment for video to be ready before requesting sync
-    setTimeout(() => {
+    const requestSyncIfNeeded = (delayMs = 1500) => {
       if (!isInRoom || !video || syncRequestSent) return;
       
-      console.log("[Flixers] Video ready, requesting sync from peers");
-      syncRequestSent = true;
-      safeSend({ type: "request-sync" });
-    }, delayMs);
+      // Wait a moment for video to be ready before requesting sync
+      setTimeout(() => {
+        if (!isInRoom || !video || syncRequestSent) return;
+        
+        console.log("[Flixers] Video ready, requesting sync from peers");
+        syncRequestSent = true;
+        safeSend({ type: "request-sync" });
+      }, delayMs);
   };
   
   // Manual resync triggered by user
@@ -902,11 +982,88 @@ const PlayerSync = (() => {
       const path = new URL(window.location.href).pathname;
       if (!path.includes("/watch/")) return;
       if (lastEpisodePath === path) return;
+      
+      // If we navigated here due to a remote resync/episode-change, don't re-announce it
+      // (prevents duplicate "next episode" messages and ping-pong navigation).
+      if (lastSyncTargetPath && lastSyncTargetPath === path) {
+        lastEpisodePath = path;
+        lastEpisodeChangeTs = lastEpisodeChangeTs || Date.now();
+        lastSyncTargetPath = null;
+        return;
+      }
+      
+      const ts = Date.now();
+      const initialTitle = NetflixAdapter.getTitle ? NetflixAdapter.getTitle() : null;
       lastEpisodePath = path;
-      safeSend({ type: "episode-changed", url: window.location.href });
+      lastEpisodeChangeTs = ts;
+      safeSend({ type: "episode-changed", url: window.location.href, ts, title: initialTitle });
+      // Re-try sending once the new title is actually visible (Netflix can update it late).
+      if (titleRetryTimer) {
+        clearInterval(titleRetryTimer);
+      }
+      titleRetryTargetPath = path;
+      const startedAt = Date.now();
+      titleRetryTimer = setInterval(() => {
+        if (!isInRoom) {
+          clearInterval(titleRetryTimer);
+          titleRetryTimer = null;
+          titleRetryTargetPath = null;
+          return;
+        }
+        if (window.location.pathname !== titleRetryTargetPath) {
+          clearInterval(titleRetryTimer);
+          titleRetryTimer = null;
+          titleRetryTargetPath = null;
+          return;
+        }
+        const delayedTitle = NetflixAdapter.getTitle ? NetflixAdapter.getTitle() : null;
+        if (delayedTitle && delayedTitle !== initialTitle) {
+          safeSend({ type: "episode-changed", url: window.location.href, ts, title: delayedTitle });
+          clearInterval(titleRetryTimer);
+          titleRetryTimer = null;
+          titleRetryTargetPath = null;
+          return;
+        }
+        if (Date.now() - startedAt > 15000) {
+          clearInterval(titleRetryTimer);
+          titleRetryTimer = null;
+          titleRetryTargetPath = null;
+        }
+      }, 500);
     } catch (_) {
       // ignore URL parse errors
     }
+  };
+
+  const forceNavigateToEpisode = (url, ts, sender, seq) => {
+    if (!url) return false;
+    let targetPath = null;
+    try {
+      targetPath = new URL(url).pathname;
+    } catch (_) {
+      return false;
+    }
+    if (!targetPath.includes("/watch/")) return false;
+    const currentPath = window.location.pathname;
+    const nowTs = typeof ts === "number" ? ts : Date.now();
+    if (currentPath === targetPath) {
+      // Already there; record seq/timestamp for dedupe
+      if (sender && seq !== undefined && seq !== null) {
+        lastEpisodeSeqBySender.set(sender, seq);
+      }
+      lastEpisodeChangeTs = Math.max(lastEpisodeChangeTs, nowTs);
+      return false;
+    }
+    lastSyncTargetPath = targetPath;
+    pendingNavigationTarget = targetPath;
+    syncRequestSent = false;
+    if (sender && seq !== undefined && seq !== null) {
+      lastEpisodeSeqBySender.set(sender, seq);
+    }
+    lastEpisodeChangeTs = Math.max(lastEpisodeChangeTs, nowTs);
+    console.log("[Flixers] Direct navigation to new episode:", { url, sender, seq, ts: nowTs, currentPath });
+    window.location.href = url;
+    return true;
   };
 
   const wirePlayer = (el) => {
@@ -984,23 +1141,83 @@ const PlayerSync = (() => {
       reason,
       ts: Date.now(),
       url: state.url,
+      title: state.title,
     };
   };
 
   const applyState = async (payload, isRetry = false, retryContext = {}) => {
     if (!payload) return;
+    const incomingTs = typeof payload.ts === "number" ? payload.ts : Date.now();
+    payload.ts = incomingTs;
+    let targetPath = null;
+    if (payload.url) {
+      try {
+        targetPath = new URL(payload.url).pathname;
+      } catch (_) {
+        targetPath = null;
+      }
+    }
     
     // Deduplicate: don't process the same sync request twice (unless it's a retry)
-    const payloadKey = `${payload.ts}-${payload.t}`;
+    const payloadKey = `${incomingTs}-${payload.t}`;
     if (!isRetry && applyState._lastPayloadKey === payloadKey) {
       console.log("[Flixers] Duplicate sync request ignored");
       return;
+    }
+    
+    if (payload.reason === "resync") {
+      const sender = payload.fromId || payload.from || "peer";
+      const seq = Number.isFinite(payload.seq) ? Number(payload.seq) : null;
+      const prevSeq = lastEpisodeSeqBySender.get(sender);
+      const targetMatchesCurrent =
+        (targetPath && targetPath === window.location.pathname) ||
+        (targetPath && targetPath === lastEpisodePath);
+      if (
+        !isRetry &&
+        ((seq !== null && typeof prevSeq === "number" && seq <= prevSeq) ||
+          (seq === null && targetMatchesCurrent && incomingTs <= lastEpisodeChangeTs))
+      ) {
+        console.log("[Flixers] Ignoring stale resync/episode-change", {
+          incomingTs,
+          lastEpisodeChangeTs,
+          seq,
+          prevSeq,
+          targetPath,
+          currentPath: window.location.pathname,
+          lastEpisodePath,
+        });
+        return;
+      }
+      if (!isRetry) {
+        if (seq !== null) {
+          lastEpisodeSeqBySender.set(sender, seq);
+        }
+        lastEpisodeChangeTs = Math.max(lastEpisodeChangeTs, incomingTs);
+      }
     }
     
     console.log("[Flixers] applyState called with:", JSON.stringify(payload), isRetry ? "(retry)" : "");
     
     // Track retry context
     const ctx = retryContext.retryCount !== undefined ? retryContext : { retryCount: 0, bridgeRetried: false };
+
+    // Fast-path navigation for explicit episode changes, even if the player isn't ready yet
+    if (payload.reason === "resync" && payload.url && targetPath) {
+      const currentPath = window.location.pathname;
+      if (targetPath.includes("/watch/") && currentPath !== targetPath) {
+        if (pendingNavigationTarget && pendingNavigationTarget === targetPath) {
+          console.log("[Flixers] Navigation already pending to", targetPath);
+        } else {
+          lastSyncTargetPath = targetPath;
+          pendingNavigationTarget = targetPath;
+          syncRequestSent = false; // allow fresh sync after landing
+          applyState._lastPayloadKey = payloadKey; // mark processed to avoid re-looping
+          console.log("[Flixers] Fast navigation to new episode:", payload.url);
+          window.location.href = payload.url;
+          return;
+        }
+      }
+    }
     
     // Use adapter to check if video is ready
     if (!NetflixAdapter.isReady()) {
@@ -1034,30 +1251,39 @@ const PlayerSync = (() => {
     // Check if we're on the right video; allow navigation when target differs, with loop protection
     if (payload?.url) {
       const currentPath = window.location.pathname;
-      const navigationAllowed = payload.reason === "sync" || payload.reason === "resync";
+      // Only navigate on explicit resync/episode-change events.
+      // Normal playback state updates should never force cross-episode navigation.
+      const navigationAllowed = payload.reason === "resync";
       try {
-        const targetPath = new URL(payload.url).pathname;
-        const targetIsWatch = targetPath.includes("/watch/");
+        const navTargetPath = new URL(payload.url).pathname;
+        const targetIsWatch = navTargetPath.includes("/watch/");
 
-        if (targetIsWatch && currentPath !== targetPath) {
+        if (targetIsWatch && currentPath !== navTargetPath) {
           // Loop protection: if we're already navigating to this target, ignore duplicates
-          if (pendingNavigationTarget && pendingNavigationTarget === targetPath) {
-            console.log("[Flixers] Already navigating to target episode:", targetPath);
+          if (pendingNavigationTarget && pendingNavigationTarget === navTargetPath) {
+            console.log("[Flixers] Already navigating to target episode:", navTargetPath);
             return;
           }
-          // Allow navigation on sync/resync OR when target differs and no pending nav
-          if (navigationAllowed || !pendingNavigationTarget) {
-            lastSyncTargetPath = targetPath;
-            pendingNavigationTarget = targetPath;
+          
+          // Only allow navigation for explicit resync flows
+          if (navigationAllowed) {
+            lastSyncTargetPath = navTargetPath;
+            pendingNavigationTarget = navTargetPath;
             syncRequestSent = false; // allow a fresh sync after navigation
             console.log("[Flixers] Navigating to new episode for sync:", payload.url);
             window.location.href = payload.url;
             return;
           }
-          // If we reach here, we have a different target while another is pending; ignore to avoid flapping
-          console.log("[Flixers] Ignoring different episode target while navigation pending:", targetPath);
+          
+          // Ignore cross-episode navigation attempts from non-resync messages
+          console.log(
+            "[Flixers] Ignoring cross-episode navigation attempt (reason=" +
+              payload.reason +
+              "):",
+            navTargetPath
+          );
           return;
-        } else if (targetIsWatch && currentPath === targetPath) {
+        } else if (targetIsWatch && currentPath === navTargetPath) {
           // We are on the target path now; clear target so future syncs apply
           lastSyncTargetPath = null;
           pendingNavigationTarget = null;
@@ -1186,7 +1412,7 @@ const PlayerSync = (() => {
     // This prevents triggering Netflix DRM when not needed
   };
 
-  return { start, applyState, announcePlayer, setInRoom, requestResync };
+  return { start, applyState, announcePlayer, setInRoom, requestResync, forceNavigateToEpisode };
 })();
 
 function Avatar({ name, avatarUrl }) {
@@ -1206,10 +1432,10 @@ function Avatar({ name, avatarUrl }) {
   </div>`;
 }
 
-function Message({ msg, selfName }) {
-  const isMine = !!selfName && msg.from === selfName;
-  const displayName = isMine ? "You" : (msg.from || "Anon");
-  const avatarUrl = isMine ? null : msg.avatar;
+function Message({ msg, selfId }) {
+  const isMine = !!selfId && !!msg.fromId && msg.fromId === selfId;
+  const displayName = msg.from || (isMine ? "You" : "Anon");
+  const avatarUrl = msg.avatar || null;
   const timeLabel =
     msg.ts &&
     new Date(msg.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
@@ -1217,34 +1443,40 @@ function Message({ msg, selfName }) {
     "flixers-message",
     msg.pending ? "flixers-message--pending" : "",
     isMine ? "flixers-message--own" : "",
-    isMine ? "flixers-message--right" : "flixers-message--left",
   ]
     .filter(Boolean)
     .join(" ");
   return html`<div class=${classes}>
-    ${!isMine ? html`<${Avatar} name=${displayName} avatarUrl=${avatarUrl} />` : null}
+    <${Avatar} name=${displayName} avatarUrl=${avatarUrl} />
     <div class="flixers-message__body">
-      <div class="flixers-message__meta ${isMine ? "flixers-message__meta--right" : ""}">
-        ${isMine
-          ? html`<span class="flixers-from">${displayName}</span>`
-          : html`<span class="flixers-from">${displayName}</span>`}
+      <div class="flixers-message__meta">
+        <span class="flixers-from">${displayName}</span>
         ${msg.pending ? html`<span class="flixers-pending">queued</span>` : null}
       </div>
       <div
         class="flixers-message__text"
         dangerouslySetInnerHTML=${{ __html: escapeHtml(msg.text || "") }}
       ></div>
-      <div class="flixers-message__footer ${isMine ? "flixers-message__footer--right" : ""}">
+      <div class="flixers-message__footer">
         ${timeLabel ? html`<span class="flixers-time">${timeLabel}</span>` : null}
       </div>
     </div>
-    ${isMine ? null : null}
   </div>`;
 }
 
 function SystemMessage({ msg }) {
+  const handleClick = (e) => {
+    if (!msg.url) return;
+    e.preventDefault();
+    try {
+      window.location.href = msg.url;
+    } catch (_) {}
+  };
+  const body = msg.url
+    ? html`<a href=${msg.url} onClick=${handleClick}>${msg.text}</a>`
+    : msg.text;
   return html`<div class="flixers-system-message">
-    <span class="flixers-system-text">${msg.text}</span>
+    <span class="flixers-system-text">${body}</span>
     ${msg.ts
       ? html`<span class="flixers-system-time">
           ${new Date(msg.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
@@ -1253,28 +1485,32 @@ function SystemMessage({ msg }) {
   </div>`;
 }
 
-function PresenceList({ users, presenceAvatars }) {
-  if (!users?.length) {
+function PresenceList({ participants, presenceAvatars }) {
+  if (!participants?.length) {
     return html`<div class="flixers-chip">No one online</div>`;
   }
   
-  const lookupAvatar = (name) => {
-    const entry = presenceAvatars?.get(name);
-    if (!entry) return null;
+  const lookupAvatar = (id, fallback) => {
+    const entry = presenceAvatars?.get(id);
+    if (!entry) return fallback || null;
     // Support both { url } (presence) and { avatar } (chat history) shapes
-    return entry.url || entry.avatar || null;
+    return entry.url || entry.avatar || fallback || null;
   };
 
-  return users.map((u) => {
-    const avatarUrl = lookupAvatar(u);
-    return html`<div class="flixers-chip" key=${u}>
-      <${Avatar} name=${u} avatarUrl=${avatarUrl} />
+  return participants.map((p) => {
+    const id = p?.id || p?.name;
+    const name = p?.name || "Guest";
+    const avatarUrl = lookupAvatar(id, p?.picture || null);
+    return html`<div class="flixers-chip" key=${id}>
+      <${Avatar} name=${name} avatarUrl=${avatarUrl} />
     </div>`;
   });
 }
 
 function TypingIndicator({ typing }) {
-  const names = Object.keys(typing).filter((k) => typing[k]);
+  const names = Object.values(typing || {})
+    .filter((v) => v?.active)
+    .map((v) => v?.name || "Someone");
   if (!names.length) return null;
   const label = names.length === 1 ? `${names[0]} is typing…` : `${names.length} people are typing…`;
   return html`<div class="flixers-typing">${label}</div>`;
@@ -1312,28 +1548,40 @@ function App() {
   const [participants, setParticipants] = useState([]);
   const [typing, setTyping] = useState({});
   const [session, setSession] = useState(null);
-  const [playerStatus, setPlayerStatus] = useState({ present: false, playing: false });
+  const [playerStatus, setPlayerStatus] = useState({ present: false, playing: false, title: null, url: null });
   const [open, setOpen] = useState(true);
   const [fullyHidden, setFullyHidden] = useState(false);
   const [controlBarVisible, setControlBarVisible] = useState(true);
   const [input, setInput] = useState("");
+  const [roomEndNotice, setRoomEndNotice] = useState(null); // { kind, roomId, text, ts }
   const presenceAvatars = useRef(new Map());
   const lastTyping = useRef({});
   const typingTimer = useRef(null);
   const seenMessages = useRef(new Set());
   const roomRef = useRef(room);
+  const roomEndNoticeRef = useRef(null);
   const messagesRef = useRef(null);
   const controlBarHideTimer = useRef(null);
   const lastHealthAlert = useRef(0);
   roomRef.current = room;
-  const setPresenceAvatar = (name, url) => {
-    if (!name || !url) return;
-    presenceAvatars.current.set(name, { url });
+  const setRoomEndNoticeSafe = (notice) => {
+    roomEndNoticeRef.current = notice;
+    setRoomEndNotice(notice);
+  };
+  const setPresenceAvatar = (id, url) => {
+    if (!id || !url) return;
+    presenceAvatars.current.set(id, { url });
   };
   const mergePresenceAvatars = (avatarObj = {}) => {
-    Object.entries(avatarObj).forEach(([name, url]) => {
-      if (url) setPresenceAvatar(name, url);
+    Object.entries(avatarObj).forEach(([id, url]) => {
+      if (url) setPresenceAvatar(id, url);
     });
+  };
+  const handleNowPlayingNavigate = (e) => {
+    e?.preventDefault?.();
+    if (playerStatus?.url) {
+      window.location.href = playerStatus.url;
+    }
   };
 
   const scrollMessagesToBottom = (force) => {
@@ -1360,9 +1608,10 @@ function App() {
           present: true,
           playing: !video.paused,
           url: window.location.href,
+          title: NetflixAdapter.getTitle ? NetflixAdapter.getTitle() : null,
         });
       }
-    }, 3000);
+    }, 5000);
     // Also periodically check room state in case messages were missed
     const roomCheckInterval = setInterval(() => {
       if (!isContextValid()) return;
@@ -1381,6 +1630,26 @@ function App() {
       clearInterval(roomCheckInterval);
     };
   }, []);
+
+  // Keep Now Playing fresh even if messages are missed
+  useEffect(() => {
+    if (!room.roomId) return;
+    const poll = () => {
+      if (!isContextValid()) return;
+      safeSend({ type: "player-status" }, (res) => {
+        if (!res) return;
+        setPlayerStatus({
+          present: !!res.present,
+          playing: !!res.playing,
+          url: res.url || null,
+          title: res.title || null,
+        });
+      });
+    };
+    poll();
+    const interval = setInterval(poll, 5000);
+    return () => clearInterval(interval);
+  }, [room.roomId]);
 
   // Apply sidebar mode to free video space whenever chat is open
   useEffect(() => {
@@ -1465,18 +1734,28 @@ function App() {
         PlayerSync.applyState(message.payload);
       }
       if (message.type === "chat") {
-        if (message.avatar) setPresenceAvatar(message.from, message.avatar);
-        pushMessage({ from: message.from || "Anon", text: message.text || "", ts: message.ts, avatar: message.avatar });
+        const fromId = message.fromId || message.from || null;
+        if (fromId && message.avatar) setPresenceAvatar(fromId, message.avatar);
+        pushMessage({
+          from: message.from || "Anon",
+          fromId,
+          text: message.text || "",
+          ts: message.ts,
+          avatar: message.avatar,
+        });
         // Force scroll to bottom when receiving a message
         setTimeout(() => scrollMessagesToBottom(true), 50);
       }
       if (message.type === "system") {
-        pushMessage({ type: "system", text: message.text, ts: message.ts });
+        pushMessage({ type: "system", text: message.text, ts: message.ts, url: message.url, title: message.title });
         setTimeout(() => scrollMessagesToBottom(true), 50);
       }
       if (message.type === "presence") {
         mergePresenceAvatars(message.avatars);
-        setParticipants(message.users || []);
+        const next = Array.isArray(message.participants)
+          ? message.participants
+          : (message.users || []).map((name) => ({ id: name, name }));
+        setParticipants(next);
       }
       if (message.type === "ws-status") {
         setConnection(message.status || "idle");
@@ -1489,15 +1768,17 @@ function App() {
         }
       }
       if (message.type === "typing") {
-        const from = message.from || "Someone";
-        lastTyping.current[from] = Date.now();
-        setTyping((prev) => ({ ...prev, [from]: !!message.active }));
+        const fromId = message.fromId || message.from || "someone";
+        const fromName = message.from || "Someone";
+        lastTyping.current[fromId] = Date.now();
+        setTyping((prev) => ({ ...prev, [fromId]: { name: fromName, active: !!message.active } }));
       }
       if (message.type === "player-present") {
         setPlayerStatus({
           present: !!message.present,
           playing: !!message.playing,
           url: message.url,
+          title: message.title || null,
         });
       }
       if (message.type === "room-update") {
@@ -1505,6 +1786,7 @@ function App() {
         // Tell PlayerSync whether we're in a room
         PlayerSync.setInRoom(!!message.roomId);
         if (message.roomId) {
+          setRoomEndNoticeSafe(null);
           // Auto-open overlay when joining a room
           setOpen(true);
           // Scroll to bottom after messages load
@@ -1512,29 +1794,66 @@ function App() {
           // Note: Don't auto-trigger resync here - let the natural flow handle it
           // The joiner's requestSyncIfNeeded() will trigger after video loads
         } else {
-          resetChatState();
+          if (!roomEndNoticeRef.current) {
+            setRoomEndNoticeSafe(null);
+            resetChatState();
+          }
         }
       }
       if (message.type === "auth") {
         setSession(message.session || null);
         if (!message.session) {
+          setRoomEndNoticeSafe(null);
           setRoom({ roomId: null, name: "Guest" });
           resetChatState();
         }
       }
-    if (message.type === "room-deleted") {
-      purgeRoomMessages(message.roomId);
-      if (roomRef.current?.roomId === message.roomId) {
-        setRoom({ roomId: null, name: "Guest" });
-        resetChatState();
-        setParticipants([]);
-        setConnection("disconnected");
+      if (message.type === "room-deleted") {
+        purgeRoomMessages(message.roomId);
+        if (roomRef.current?.roomId === message.roomId) {
+          const ts = Date.now();
+          const notice = {
+            kind: "expired",
+            roomId: message.roomId,
+            text: "Room expired. Please create or join a new room.",
+            ts,
+          };
+          setRoomEndNoticeSafe(notice);
+          setRoom({ roomId: null, name: "Guest" });
+          PlayerSync.setInRoom(false);
+          setParticipants([]);
+          setTyping({});
+          lastTyping.current = {};
+          setConnection("disconnected");
+          setFullyHidden(false);
+          setOpen(true);
+          seenMessages.current.clear();
+          setMessages([{ type: "system", text: notice.text, ts: notice.ts }]);
+          setTimeout(() => scrollMessagesToBottom(true), 50);
+        }
       }
-    }
     if (message.type === "episode-changed" && message.url) {
-      // Treat as a resync trigger to navigate to the target episode
+      const ts = typeof message.ts === "number" ? message.ts : Date.now();
+      const fromId = message.fromId || message.from || null;
+      console.log("[Flixers] episode-changed message", {
+        url: message.url,
+        ts,
+        from: message.from,
+        fromId,
+        seq: message.seq,
+        reason: message.reason,
+      });
+      // Force navigation first, then apply state in case we're already there
+      PlayerSync.forceNavigateToEpisode(message.url, ts, fromId, message.seq);
       PlayerSync.applyState(
-        { url: message.url, reason: "resync", t: 0, paused: true, ts: Date.now() },
+        {
+          url: message.url,
+          reason: message.reason || "resync",
+          ts,
+          from: message.from,
+          fromId,
+          seq: message.seq,
+        },
         false,
         { retryCount: 0, bridgeRetried: false }
       );
@@ -1547,14 +1866,23 @@ function App() {
     });
     safeSend({ type: "get-presence" }, (res) => {
       if (res?.avatars) mergePresenceAvatars(res.avatars);
-      if (res?.users) setParticipants(res.users);
+      if (res?.participants) {
+        setParticipants(res.participants);
+      } else if (res?.users) {
+        setParticipants((res.users || []).map((name) => ({ id: name, name })));
+      }
     });
     safeSend({ type: "get-connection-status" }, (res) => {
       if (res?.status) setConnection(res.status);
     });
     safeSend({ type: "player-status" }, (res) => {
       if (!res) return;
-      setPlayerStatus({ present: !!res.present, playing: !!res.playing, url: res.url });
+      setPlayerStatus({
+        present: !!res.present,
+        playing: !!res.playing,
+        url: res.url,
+        title: res.title || null,
+      });
     });
     safeSend({ type: "auth-get" }, (res) => {
       setSession(res?.session || null);
@@ -1582,6 +1910,12 @@ function App() {
 
   useEffect(() => {
     if (!room.roomId) {
+      const notice = roomEndNoticeRef.current;
+      if (notice?.kind === "expired") {
+        seenMessages.current.clear();
+        setMessages([{ type: "system", text: notice.text, ts: notice.ts }]);
+        return;
+      }
       resetChatState();
       return;
     }
@@ -1650,7 +1984,7 @@ function App() {
   }, []);
 
   const pushMessage = (msg) => {
-    const key = `${msg.from || "anon"}-${msg.ts || Date.now()}-${msg.text || ""}`;
+    const key = `${msg.fromId || msg.from || "anon"}-${msg.ts || Date.now()}-${msg.text || ""}`;
     if (seenMessages.current.has(key)) return;
     seenMessages.current.add(key);
     setMessages((prev) => {
@@ -1669,7 +2003,7 @@ function App() {
   };
 
   const activeTyping = useMemo(
-    () => Object.fromEntries(Object.entries(typing).filter(([, v]) => v)),
+    () => Object.fromEntries(Object.entries(typing).filter(([, v]) => v?.active)),
     [typing]
   );
 
@@ -1682,6 +2016,7 @@ function App() {
     safeSend({ type: "chat", text });
     pushMessage({
       from: session?.profile?.name || "You",
+      fromId: session?.profile?.sub || null,
       text,
       ts: Date.now(),
       avatar: session?.profile?.picture || null,
@@ -1744,7 +2079,7 @@ function App() {
         }
         const list = Array.isArray(res[key]) ? res[key] : [];
         seenMessages.current = new Set(
-          list.map((m) => `${m.from || "anon"}-${m.ts || ""}-${m.text || ""}`)
+          list.map((m) => `${m.fromId || m.from || "anon"}-${m.ts || ""}-${m.text || ""}`)
         );
         setMessages(list.slice(-200));
         scrollMessagesToBottom(true);
@@ -1763,11 +2098,15 @@ function App() {
   const presenceAvatarsMemo = useMemo(() => {
     const map = presenceAvatars.current;
     participants.forEach((p) => {
-      if (!map.has(p)) {
-        map.set(p, { url: null });
+      const id = p?.id || p?.name;
+      if (!id) return;
+      if (!map.has(id)) {
+        map.set(id, { url: p?.picture || null });
+      } else if (p?.picture && !map.get(id)?.url) {
+        map.set(id, { url: p.picture });
       }
-      if (session?.profile?.picture && session?.profile?.name === p) {
-        map.set(p, { url: session.profile.picture });
+      if (session?.profile?.picture && session?.profile?.sub && session.profile.sub === id) {
+        map.set(id, { url: session.profile.picture });
       }
     });
     return map;
@@ -1831,7 +2170,15 @@ function App() {
               People · ${participants.length}
             </div>
             <div class="flixers-chips">
-              <${PresenceList} users=${participants} presenceAvatars=${presenceAvatarsMemo} />
+              <${PresenceList} participants=${participants} presenceAvatars=${presenceAvatarsMemo} />
+            </div>
+            <div class="flixers-nowplaying">
+              <span class="flixers-presence-title" style=${{ marginBottom: 0 }}>Now Playing</span>
+              ${playerStatus?.url
+                ? html`<a href=${playerStatus.url} onClick=${handleNowPlayingNavigate}>
+                    ${playerStatus.title || "Current video"}
+                  </a>`
+                : html`<span style=${{ color: "#94a3b8" }}>No video detected</span>`}
             </div>
           </div>
           <div class="flixers-status">
@@ -1845,7 +2192,11 @@ function App() {
                 : "Disconnected - trying to reconnect..."
               : "Join a room from the popup to start chatting"}
           </div>
-          ${connection !== "connected"
+          ${roomEndNotice?.kind === "expired"
+            ? html`<div class="flixers-connection-banner" role="alert">
+                ${roomEndNotice.text}
+              </div>`
+            : room.roomId && connection !== "connected"
             ? html`<div class="flixers-connection-banner">
                 ${connection === "reconnecting" || connection === "connecting"
                   ? "Reconnecting… hold tight"
@@ -1862,7 +2213,7 @@ function App() {
             ${messages.map((m, idx) =>
               m.type === "system"
                 ? html`<${SystemMessage} msg=${m} key=${`sys-${m.ts || idx}-${idx}`} />`
-                : html`<${Message} msg=${m} selfName=${session?.profile?.name || null} key=${`${m.ts || idx}-${idx}`} />`
+                : html`<${Message} msg=${m} selfId=${session?.profile?.sub || null} key=${`${m.ts || idx}-${idx}`} />`
             )}
           </div>
           <${TypingIndicator} typing=${activeTyping} />
@@ -2120,6 +2471,9 @@ function injectStyles() {
     .flixers-pill--warm { background: rgba(255, 178, 122, 0.14); border-color: #ffb27a; color: #ffb27a; }
     .flixers-meta { margin: 12px 0 8px; }
     .flixers-presence-title { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: #9aa5c4; margin-bottom: 6px; }
+    .flixers-nowplaying { margin: 8px 0 10px; color: #cbd5e1; font-size: 13px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; line-height: 1.4; }
+    .flixers-nowplaying a { color: #ffb86c; text-decoration: none; font-weight: 700; display: inline-block; line-height: 1.4; }
+    .flixers-nowplaying a:hover { text-decoration: underline; }
     .flixers-chips { display: flex; flex-wrap: wrap; gap: 6px; }
     .flixers-chip { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; border-radius: 999px; border: 1px solid rgba(255,255,255,0.08); background: rgba(255,255,255,0.04); font-size: 13px; color: #f8fafc; }
     .flixers-status { font-size: 12px; color: #cbd5e1; margin: 6px 0 10px; letter-spacing: 0.01em; }
@@ -2144,10 +2498,11 @@ function injectStyles() {
     .flixers-time { color: #94a3b8; }
     .flixers-pending { color: #ffb27a; font-size: 11px; font-style: italic; }
     .flixers-message--pending { opacity: 0.7; border-style: dashed; }
-    .flixers-message--own { border-color: rgba(255,255,255,0.14); background: linear-gradient(135deg, rgba(35,46,80,0.95), rgba(25,30,50,0.9)); }
-    .flixers-message--own .flixers-from { color: #ffd166; }
-    .flixers-message--own .flixers-time { color: #cbd5e1; }
-    .flixers-message--own .flixers-avatar { box-shadow: 0 0 0 2px rgba(255, 209, 102, 0.35); }
+    /* Own messages match the same bubble style as others (layout still right-aligned). */
+    .flixers-message--own { border-color: rgba(255,255,255,0.05); background: linear-gradient(145deg, rgba(20,26,42,0.95), rgba(15,20,32,0.92)); }
+    .flixers-message--own .flixers-from { color: #ffb86c; }
+    .flixers-message--own .flixers-time { color: #94a3b8; }
+    .flixers-message--own .flixers-avatar { box-shadow: none; }
     .flixers-message__footer { display: flex; justify-content: flex-end; margin-top: 6px; }
     .flixers-message__text { color: #f8fafc; line-height: 1.5; word-break: break-word; }
     .flixers-input-row { display: grid; grid-template-columns: 1fr 96px; gap: 10px; margin-top: 12px; }

@@ -8,11 +8,13 @@ const jwt = require("jsonwebtoken");
 
 // Redis integration with fallback
 let redis = null;
-try {
-  redis = require("./redis");
-  console.log("[Redis] Module loaded, will attempt connection");
-} catch (err) {
-  console.warn("[Redis] Module not available, using in-memory storage only");
+if (!process.env.JEST_WORKER_ID) {
+  try {
+    redis = require("./redis");
+    console.log("[Redis] Module loaded, will attempt connection");
+  } catch (err) {
+    console.warn("[Redis] Module not available, using in-memory storage only");
+  }
 }
 
 const PORT = process.env.PORT || 4000;
@@ -27,8 +29,23 @@ const oauthClient = new OAuth2Client(GOOGLE_CLIENT_ID || undefined);
 // In-memory room storage: roomId -> { clients, encryptionRequired, videoUrl, titleId, initialTime, deletionTimer }
 const rooms = new Map();
 
+const { ROOM_CLEANUP_DELAY_MS } = require("./roomLifecycle");
+
 // Room cleanup delay - keep empty rooms for 1 day before deletion
-const ROOM_CLEANUP_DELAY = 24 * 60 * 60 * 1000; // 1 day in milliseconds
+const ROOM_CLEANUP_DELAY = ROOM_CLEANUP_DELAY_MS;
+
+function formatRoomCleanupDelay(ms) {
+  const minutes = Math.round(ms / 60000);
+  if (minutes % (60 * 24) === 0) {
+    const days = minutes / (60 * 24);
+    return `${days} day${days === 1 ? "" : "s"}`;
+  }
+  if (minutes % 60 === 0) {
+    const hours = minutes / 60;
+    return `${hours} hour${hours === 1 ? "" : "s"}`;
+  }
+  return `${minutes} min`;
+}
 
 app.post("/auth/google", async (req, res) => {
   const idToken = req.body?.idToken;
@@ -158,43 +175,51 @@ const wss = new WebSocketServer({ server, path: "/ws" });
 const PING_INTERVAL = 15000; // Send ping every 15 seconds (matching client)
 const ACTIVITY_TIMEOUT = 7200000; // Consider connection dead after 2 hours of no activity
 
-// Start server-side ping interval - uses both native ping AND checks activity
-const pingInterval = setInterval(() => {
-  const now = Date.now();
-  
-  wss.clients.forEach((socket) => {
-    // Check activity timeout first
-    const lastActivity = socket.lastActivity || 0;
-    const timeSinceActivity = now - lastActivity;
+let pingInterval = null;
+
+function startPingInterval() {
+  if (pingInterval) return;
+  // Start server-side ping interval - uses both native ping AND checks activity
+  pingInterval = setInterval(() => {
+    const now = Date.now();
     
-    if (timeSinceActivity > ACTIVITY_TIMEOUT) {
-      console.log(`[WS] Terminating inactive connection (no activity for ${Math.round(timeSinceActivity / 1000)}s)`);
-      return socket.terminate();
-    }
-    
-    // Check if native ping was answered
-    if (socket.isAlive === false) {
-      console.log("[WS] Terminating stale connection (no pong response)");
-      return socket.terminate();
-    }
-    
-    // Send native ping and mark as waiting for pong
-    socket.isAlive = false;
-    socket.ping();
-    
-    // Also send JSON ping for clients that may not respond to native pings
-    if (socket.readyState === 1) {
-      try {
-        socket.send(JSON.stringify({ type: "ping", ts: now }));
-      } catch (err) {
-        console.warn("[WS] Failed to send JSON ping:", err.message);
+    wss.clients.forEach((socket) => {
+      // Check activity timeout first
+      const lastActivity = socket.lastActivity || 0;
+      const timeSinceActivity = now - lastActivity;
+      
+      if (timeSinceActivity > ACTIVITY_TIMEOUT) {
+        console.log(`[WS] Terminating inactive connection (no activity for ${Math.round(timeSinceActivity / 1000)}s)`);
+        return socket.terminate();
       }
-    }
-  });
-}, PING_INTERVAL);
+      
+      // Check if native ping was answered
+      if (socket.isAlive === false) {
+        console.log("[WS] Terminating stale connection (no pong response)");
+        return socket.terminate();
+      }
+      
+      // Send native ping and mark as waiting for pong
+      socket.isAlive = false;
+      socket.ping();
+      
+      // Also send JSON ping for clients that may not respond to native pings
+      if (socket.readyState === 1) {
+        try {
+          socket.send(JSON.stringify({ type: "ping", ts: now }));
+        } catch (err) {
+          console.warn("[WS] Failed to send JSON ping:", err.message);
+        }
+      }
+    });
+  }, PING_INTERVAL);
+}
 
 wss.on("close", () => {
-  clearInterval(pingInterval);
+  if (pingInterval) {
+    clearInterval(pingInterval);
+    pingInterval = null;
+  }
 });
 
 wss.on("connection", (socket, req) => {
@@ -269,14 +294,16 @@ wss.on("connection", (socket, req) => {
     console.log(`[leave] ${name} -> ${roomId}`);
     broadcastPresence(roomId);
     
-    // Schedule room cleanup when empty (after 1 hour delay)
+    // Schedule room cleanup when empty (after ROOM_CLEANUP_DELAY)
     if (currentRoom.clients.size === 0) {
       // Clear any existing deletion timer
       if (currentRoom.deletionTimer) {
         clearTimeout(currentRoom.deletionTimer);
       }
       
-      console.log(`[Room] ${roomId} is now empty, scheduling deletion in 1 hour`);
+      console.log(
+        `[Room] ${roomId} is now empty, scheduling deletion in ${formatRoomCleanupDelay(ROOM_CLEANUP_DELAY)}`
+      );
       currentRoom.deletionTimer = setTimeout(() => {
         const room = rooms.get(roomId);
         // Only delete if still empty
@@ -294,13 +321,17 @@ wss.on("connection", (socket, req) => {
 });
 
 function start(port = PORT) {
+  startPingInterval();
   return server.listen(port, () => {
     console.log(`API listening on :${port}`);
   });
 }
 
 function stop(cb) {
-  clearInterval(pingInterval);
+  if (pingInterval) {
+    clearInterval(pingInterval);
+    pingInterval = null;
+  }
   wss.close(() => server.close(cb));
 }
 
@@ -365,6 +396,7 @@ function handleMessage(roomId, client, msg) {
     msg.type === "encrypted" ||
     msg.type === "key-exchange" ||
     msg.type === "system" ||
+    msg.type === "episode-changed" ||
     msg.type === "sync-request" ||  // Allow sync messages even in encrypted rooms
     msg.type === "sync-state" ||     // Allow sync messages even in encrypted rooms
     !encryptionRequired;
@@ -384,7 +416,14 @@ function handleMessage(roomId, client, msg) {
     const ts = typeof msg.ts === "number" ? msg.ts : Date.now();
     broadcast(
       roomId,
-      { type: "chat", text: msg.text, from: client.name, ts },
+      {
+        type: "chat",
+        text: msg.text,
+        from: client.name,
+        fromId: client.sub,
+        avatar: msg.avatar || client.picture || null,
+        ts,
+      },
       null
     );
     return;
@@ -397,9 +436,24 @@ function handleMessage(roomId, client, msg) {
   if (msg.type === "typing") {
     broadcast(
       roomId,
-      { type: "typing", from: client.name, active: !!msg.active, ts: Date.now() },
+      { type: "typing", from: client.name, fromId: client.sub, active: !!msg.active, ts: Date.now() },
       client
     );
+    return;
+  }
+  if (msg.type === "episode-changed") {
+    const url = isNonEmptyString(msg.url) ? msg.url : "";
+    if (!url) return;
+    const ts = typeof msg.ts === "number" ? msg.ts : Date.now();
+    const seq = Number.isFinite(msg.seq) ? Number(msg.seq) : undefined;
+    const payload = { type: "episode-changed", url, from: client.name, fromId: client.sub, ts };
+    if (isNonEmptyString(msg.title)) {
+      payload.title = msg.title;
+    }
+    if (seq !== undefined) {
+      payload.seq = seq;
+    }
+    broadcast(roomId, payload, client);
     return;
   }
   if (msg.type === "key-exchange") {
@@ -412,6 +466,7 @@ function handleMessage(roomId, client, msg) {
         publicKey,
         curve: isNonEmptyString(curve) ? curve : "secp256k1",
         from: client.name,
+        fromId: client.sub,
       },
       client
     );
@@ -430,6 +485,7 @@ function handleMessage(roomId, client, msg) {
         salt: isNonEmptyString(salt) ? salt : undefined,
         alg: isNonEmptyString(alg) ? alg : "aes-256-gcm",
         from: client.name,
+        fromId: client.sub,
         ts: Date.now(),
       },
       null
@@ -445,6 +501,7 @@ function handleMessage(roomId, client, msg) {
       {
         type: "sync-request",
         from: client.name,
+        fromId: client.sub,
         ts: Date.now(),
       },
       client
@@ -464,6 +521,7 @@ function handleMessage(roomId, client, msg) {
         paused: typeof paused === "boolean" ? paused : true,
         url: isNonEmptyString(url) ? url : "",
         from: client.name,
+        fromId: client.sub,
         ts: Date.now(),
       },
       client
@@ -492,16 +550,28 @@ function broadcast(roomId, message, skipClient) {
 function broadcastPresence(roomId) {
   const room = rooms.get(roomId);
   if (!room) return;
-  const users = Array.from(room.clients).map((c) => c.name);
+  const participants = Array.from(room.clients).map((c) => ({
+    id: c.sub,
+    name: c.name,
+    picture: c.picture || null,
+  }));
+  // Backwards-compatible shape (display-only, may contain duplicates).
+  const users = participants.map((p) => p.name);
   const avatars = {};
-  room.clients.forEach((c) => {
-    if (c.picture) {
-      avatars[c.name] = c.picture;
+  participants.forEach((p) => {
+    if (p.picture) {
+      avatars[p.id] = p.picture;
     }
   });
   broadcast(
     roomId,
-    { type: "presence", users, avatars, encryptionRequired: room.encryptionRequired },
+    {
+      type: "presence",
+      participants,
+      users,
+      avatars,
+      encryptionRequired: room.encryptionRequired,
+    },
     null
   );
 }

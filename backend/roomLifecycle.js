@@ -1,0 +1,8 @@
+const ROOM_TTL_SECONDS = 24 * 60 * 60; // 1 day
+const ROOM_CLEANUP_DELAY_MS = ROOM_TTL_SECONDS * 1000;
+
+module.exports = {
+  ROOM_TTL_SECONDS,
+  ROOM_CLEANUP_DELAY_MS,
+};
+

@@ -110,14 +110,14 @@ describe("encryption flow", () => {
     handleMessage(roomId, sender, {
       type: "key-exchange",
       publicKey: "pub123",
-      curve: "secp256k1",
+      curve: "P-256",
     });
 
     expect(sent).toHaveLength(1);
     expect(sent[0]).toMatchObject({
       type: "key-exchange",
       publicKey: "pub123",
-      curve: "secp256k1",
+      curve: "P-256",
       from: "Alice",
     });
   });
@@ -153,5 +153,35 @@ describe("encryption flow", () => {
       from: "Alice",
     });
     expect(typeof sent[0].ts).toBe("number");
+  });
+
+  test("allows episode-changed broadcast even when encryption is required", () => {
+    const roomId = "room-episode";
+    const room = ensureRoom(roomId, { encryptionRequired: true });
+    const sent = [];
+    const sender = { name: "Alice", socket: { readyState: 1, send: jest.fn() } };
+    const receiver = {
+      name: "Bob",
+      socket: {
+        readyState: 1,
+        send: (data) => sent.push(JSON.parse(data)),
+      },
+    };
+    room.clients.add(sender);
+    room.clients.add(receiver);
+
+    handleMessage(roomId, sender, {
+      type: "episode-changed",
+      url: "https://www.netflix.com/watch/123456",
+      ts: 123,
+    });
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({
+      type: "episode-changed",
+      url: "https://www.netflix.com/watch/123456",
+      from: "Alice",
+      ts: 123,
+    });
   });
 });

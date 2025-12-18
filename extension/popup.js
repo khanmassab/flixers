@@ -156,7 +156,7 @@ async function previewRoom(roomId) {
     
     if (!res.ok) {
       if (res.status === 404) {
-        throw new Error("Room not found");
+        throw new Error("Room expired");
       }
       throw new Error("Failed to load room");
     }
@@ -175,7 +175,7 @@ async function previewRoom(roomId) {
   } catch (err) {
     jitterInput(roomLinkInput);
     pushToast(err.message || "Could not load room", "warn");
-    setStatus("Room not found");
+    setStatus(err?.message || "Room not found");
   } finally {
     lockControls(false);
   }
@@ -378,9 +378,21 @@ chrome.runtime.onMessage.addListener((msg) => {
       pushToast("Connection lost", "warn");
     }
   }
+  if (msg.type === "room-deleted") {
+    if (state.roomId && msg.roomId && state.roomId === msg.roomId) {
+      state.connected = false;
+      setRoom(null);
+      setConnectionPill("bad", "disconnected");
+      setStatus("Room expired");
+      pushToast("Room expired. Please create or join a new room.", "warn");
+    }
+  }
   if (msg.type === "presence") {
-    renderPresence(msg.users || []);
-    const count = msg.users?.length ?? 0;
+    const participants = Array.isArray(msg.participants)
+      ? msg.participants
+      : (msg.users || []).map((name) => ({ id: name, name }));
+    renderPresence(participants);
+    const count = participants.length ?? 0;
     setStatus(`Room ${msg.roomId || ""} · ${count} online`);
   }
   if (msg.type === "player-present") {
@@ -582,17 +594,19 @@ function lockControls(disabled) {
   roomLinkInput.disabled = disabled;
 }
 
-function renderPresence(users) {
-  state.participants = users;
+function renderPresence(participants) {
+  const list = Array.isArray(participants) ? participants : [];
+  state.participants = list;
   presenceChips.innerHTML = "";
-  if (!users.length) {
+  if (!list.length) {
     presenceChips.innerHTML = `<span class="chip">No one online</span>`;
     return;
   }
-  users.forEach((u) => {
+  list.forEach((p) => {
+    const name = typeof p === "string" ? p : p?.name;
     const chip = document.createElement("span");
     chip.className = "chip";
-    chip.textContent = u;
+    chip.textContent = name || "Guest";
     presenceChips.appendChild(chip);
   });
 }
@@ -739,10 +753,10 @@ function safeSendMessage(message, callback) {
     }
   });
   safeSendMessage({ type: "get-presence" }, (res) => {
-    if (res?.users) {
-      renderPresence(res.users);
-      state.participants = res.users;
-    }
+    const participants = Array.isArray(res?.participants)
+      ? res.participants
+      : (res?.users || []).map((name) => ({ id: name, name }));
+    renderPresence(participants);
   });
   safeSendMessage({ type: "get-connection-status" }, (res) => {
     if (res?.status) {

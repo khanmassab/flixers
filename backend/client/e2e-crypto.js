@@ -6,8 +6,14 @@ const {
   randomBytes,
 } = require("crypto");
 
-function generateKeyPair(curve = "secp256k1") {
-  const ecdh = createECDH(curve);
+function normalizeCurve(curve) {
+  if (!curve) return "prime256v1";
+  if (curve === "P-256" || curve === "secp256r1") return "prime256v1";
+  return curve;
+}
+
+function generateKeyPair(curve = "P-256") {
+  const ecdh = createECDH(normalizeCurve(curve));
   ecdh.generateKeys();
   return {
     publicKey: ecdh.getPublicKey("base64"),
@@ -16,8 +22,8 @@ function generateKeyPair(curve = "secp256k1") {
   };
 }
 
-function deriveSharedSecret(privateKeyB64, peerPublicKeyB64, curve = "secp256k1") {
-  const ecdh = createECDH(curve);
+function deriveSharedSecret(privateKeyB64, peerPublicKeyB64, curve = "P-256") {
+  const ecdh = createECDH(normalizeCurve(curve));
   ecdh.setPrivateKey(Buffer.from(privateKeyB64, "base64"));
   return ecdh.computeSecret(Buffer.from(peerPublicKeyB64, "base64"));
 }
@@ -59,14 +65,14 @@ function decryptJson({ ciphertext, iv, tag }, key) {
 }
 
 function buildEncryptedEnvelope(message, opts) {
-  const { privateKey, peerPublicKey, curve = "secp256k1", salt, info } = opts;
+  const { privateKey, peerPublicKey, curve = "P-256", salt, info } = opts;
   const secret = deriveSharedSecret(privateKey, peerPublicKey, curve);
   const { key, salt: derivedSalt } = hkdf(secret, salt, info);
   return { ...encryptJson(message, key), salt: derivedSalt };
 }
 
 function openEncryptedEnvelope(envelope, opts) {
-  const { privateKey, peerPublicKey, curve = "secp256k1", info } = opts;
+  const { privateKey, peerPublicKey, curve = "P-256", info } = opts;
   const secret = deriveSharedSecret(privateKey, peerPublicKey, curve);
   const { key } = hkdf(secret, envelope.salt, info);
   return decryptJson(envelope, key);
