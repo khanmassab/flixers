@@ -18,11 +18,33 @@ if (!process.env.JEST_WORKER_ID) {
 }
 
 const PORT = process.env.PORT || 4000;
-const JWT_SECRET = process.env.JWT_SECRET || "dev-secret";
+const JWT_SECRET = process.env.JWT_SECRET;
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
+const NODE_ENV = process.env.NODE_ENV || "development";
+
+// Validate required environment variables in production
+if (NODE_ENV === "production") {
+  if (!JWT_SECRET || JWT_SECRET === "dev-secret") {
+    console.error("ERROR: JWT_SECRET must be set in production!");
+    process.exit(1);
+  }
+  if (!GOOGLE_CLIENT_ID) {
+    console.warn("WARNING: GOOGLE_CLIENT_ID not set - auth will use dev mode");
+  }
+}
 
 const app = express();
-app.use(cors());
+
+// CORS configuration
+const corsOptions = {
+  origin: process.env.ALLOWED_ORIGINS
+    ? process.env.ALLOWED_ORIGINS.split(",")
+    : NODE_ENV === "production"
+      ? [] // Must be set in production
+      : "*", // Allow all in development
+  credentials: true,
+};
+app.use(cors(corsOptions));
 app.use(express.json());
 
 const oauthClient = new OAuth2Client(GOOGLE_CLIENT_ID || undefined);
@@ -46,6 +68,20 @@ function formatRoomCleanupDelay(ms) {
   }
   return `${minutes} min`;
 }
+
+// Health check endpoint
+app.get("/health", (req, res) => {
+  const health = {
+    status: "ok",
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    environment: NODE_ENV,
+    services: {
+      redis: redis && redis.isRedisConnected() ? "connected" : "disconnected",
+    },
+  };
+  res.json(health);
+});
 
 app.post("/auth/google", async (req, res) => {
   const idToken = req.body?.idToken;
@@ -324,8 +360,27 @@ function start(port = PORT) {
   startPingInterval();
   return server.listen(port, () => {
     console.log(`API listening on :${port}`);
+    console.log(`Environment: ${NODE_ENV}`);
+    console.log(`Redis: ${redis ? "enabled" : "disabled"}`);
   });
 }
+
+// Graceful shutdown handling
+process.on("SIGTERM", () => {
+  console.log("SIGTERM received, shutting down gracefully...");
+  stop(() => {
+    console.log("Server closed");
+    process.exit(0);
+  });
+});
+
+process.on("SIGINT", () => {
+  console.log("SIGINT received, shutting down gracefully...");
+  stop(() => {
+    console.log("Server closed");
+    process.exit(0);
+  });
+});
 
 function stop(cb) {
   if (pingInterval) {
@@ -616,6 +671,9 @@ async function verifyGoogleIdToken(idToken) {
 }
 
 function issueSessionToken(profile) {
+  if (!JWT_SECRET) {
+    throw new Error("JWT_SECRET not configured");
+  }
   const payload = {
     sub: profile.sub,
     name: profile.name,
@@ -626,6 +684,10 @@ function issueSessionToken(profile) {
 }
 
 function verifySessionToken(token) {
+  if (!JWT_SECRET) {
+    console.warn("JWT_SECRET not configured, cannot verify tokens");
+    return null;
+  }
   try {
     return jwt.verify(token, JWT_SECRET);
   } catch (err) {
