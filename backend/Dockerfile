@@ -16,7 +16,7 @@ RUN npx prisma generate
 # Remove dev dependencies
 RUN npm prune --omit=dev
 
-COPY server.js db.js redis.js ./
+COPY server.js db.js redis.js roomLifecycle.js ./
 COPY client ./client/
 
 EXPOSE 4000
