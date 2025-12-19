@@ -5,6 +5,7 @@ let useMemo = null;
 let useRef = null;
 let useState = null;
 let html = null;
+let overlayOpenGlobal = false;
 
 // Track whether the extension context has been invalidated
 let extensionContextValid = true;
@@ -103,6 +104,15 @@ function safeAddListener(handler) {
 function storageKey(roomId) {
   return `flixers-messages-${roomId}`;
 }
+
+function unreadKey(roomId) {
+  return `flixers-unread-${roomId}`;
+}
+
+const OVERLAY_STATE_KEY = "flixers-overlay-open";
+const OVERLAY_INACTIVITY_MS = 60 * 1000;
+const OVERLAY_TOP_KEY = "flixers-overlay-top";
+const OVERLAY_BOTTOM_KEY = "flixers-overlay-bottom";
 
 function purgeRoomMessages(roomId) {
   if (!roomId || !chrome?.storage?.local) return;
@@ -822,6 +832,7 @@ const PlayerSync = (() => {
   let isInRoom = false;
   let eventsWired = false;
   let syncRequestSent = false;
+  let broadcastSuppressedUntil = 0;
   let lastEpisodePath = null;
   let lastEpisodeChangeTs = 0;
   const lastEpisodeSeqBySender = new Map();
@@ -836,6 +847,7 @@ const PlayerSync = (() => {
   const getVideo = () => NetflixAdapter.findVideo();
 
   const setInRoom = (inRoom) => {
+    if (isInRoom === inRoom) return;
     isInRoom = inRoom;
     if (inRoom) {
       // Only start observing when joining a room
@@ -843,6 +855,8 @@ const PlayerSync = (() => {
       attach();
       // Reset sync request state
       syncRequestSent = false;
+      // Suppress outbound playback broadcasts until initial sync completes.
+      broadcastSuppressedUntil = Date.now() + 12000;
       // Start polling as backup
       startPolling();
     } else {
@@ -851,6 +865,7 @@ const PlayerSync = (() => {
       wiredVideoElement = null;
       eventsWired = false;
       syncRequestSent = false;
+      broadcastSuppressedUntil = 0;
       lastEpisodePath = null;
       lastEpisodeChangeTs = 0;
       lastEpisodeSeqBySender.clear();
@@ -991,6 +1006,13 @@ const PlayerSync = (() => {
         lastSyncTargetPath = null;
         return;
       }
+
+      // Seed initial episode path without broadcasting when first joining a room.
+      if (!lastEpisodePath) {
+        lastEpisodePath = path;
+        lastEpisodeChangeTs = Date.now();
+        return;
+      }
       
       const ts = Date.now();
       const initialTitle = NetflixAdapter.getTitle ? NetflixAdapter.getTitle() : null;
@@ -1077,18 +1099,21 @@ const PlayerSync = (() => {
 
   const handlePlayEvent = () => {
     if (!isInRoom || suppressNext) return;
+    if (broadcastSuppressedUntil && Date.now() < broadcastSuppressedUntil) return;
     console.log("[Flixers] Play event - broadcasting to room");
     sendState("play");
   };
 
   const handlePauseEvent = () => {
     if (!isInRoom || suppressNext) return;
+    if (broadcastSuppressedUntil && Date.now() < broadcastSuppressedUntil) return;
     console.log("[Flixers] Pause event - broadcasting to room");
     sendState("pause");
   };
 
   const handleSeekEvent = () => {
     if (!isInRoom || suppressNext) return;
+    if (broadcastSuppressedUntil && Date.now() < broadcastSuppressedUntil) return;
     const state = NetflixAdapter.getState();
     if (!state) return;
     
@@ -1147,6 +1172,9 @@ const PlayerSync = (() => {
 
   const applyState = async (payload, isRetry = false, retryContext = {}) => {
     if (!payload) return;
+    if (payload.reason === "sync") {
+      broadcastSuppressedUntil = 0;
+    }
     const incomingTs = typeof payload.ts === "number" ? payload.ts : Date.now();
     payload.ts = incomingTs;
     let targetPath = null;
@@ -1545,6 +1573,7 @@ function App() {
   const [room, setRoom] = useState({ roomId: null, name: "Guest" });
   const [connection, setConnection] = useState("idle");
   const [messages, setMessages] = useState([]);
+  const [unreadCount, setUnreadCount] = useState(0);
   const [participants, setParticipants] = useState([]);
   const [typing, setTyping] = useState({});
   const [session, setSession] = useState(null);
@@ -1554,15 +1583,30 @@ function App() {
   const [controlBarVisible, setControlBarVisible] = useState(true);
   const [input, setInput] = useState("");
   const [roomEndNotice, setRoomEndNotice] = useState(null); // { kind, roomId, text, ts }
+  const [toast, setToast] = useState(null); // { from, text, ts }
+  const [overlayTop, setOverlayTop] = useState(0); // px from top when sidebar is open
+  const [overlayBottom, setOverlayBottom] = useState(0); // px from bottom when sidebar is open
   const presenceAvatars = useRef(new Map());
   const lastTyping = useRef({});
   const typingTimer = useRef(null);
   const seenMessages = useRef(new Set());
+  const overlayPreferenceRef = useRef(true);
+  const lastInteractionRef = useRef(Date.now());
+  const inactivityTimer = useRef(null);
+  const overlayTopRef = useRef(0);
+  const overlayBottomRef = useRef(0);
   const roomRef = useRef(room);
   const roomEndNoticeRef = useRef(null);
   const messagesRef = useRef(null);
+  const inputRef = useRef(null);
   const controlBarHideTimer = useRef(null);
   const lastHealthAlert = useRef(0);
+  const toastHideTimer = useRef(null);
+  const openRef = useRef(open);
+  const prevOpenRef = useRef(open);
+  const sessionRef = useRef(session);
+  const fullyHiddenRef = useRef(fullyHidden);
+  const prevFullyHiddenRef = useRef(fullyHidden);
   roomRef.current = room;
   const setRoomEndNoticeSafe = (notice) => {
     roomEndNoticeRef.current = notice;
@@ -1571,6 +1615,57 @@ function App() {
   const setPresenceAvatar = (id, url) => {
     if (!id || !url) return;
     presenceAvatars.current.set(id, { url });
+  };
+  const persistOverlayPreference = (value) => {
+    overlayPreferenceRef.current = value;
+    if (!isContextValid()) return;
+    try {
+      chrome.storage?.local?.set({ [OVERLAY_STATE_KEY]: value }, () => {
+        if (chrome.runtime?.lastError) {
+          extensionContextValid = false;
+        }
+      });
+    } catch (_) {
+      extensionContextValid = false;
+    }
+  };
+
+  const persistOverlayTop = (value) => {
+    overlayTopRef.current = value;
+    if (!isContextValid()) return;
+    try {
+      chrome.storage?.local?.set({ [OVERLAY_TOP_KEY]: value }, () => {
+        if (chrome.runtime?.lastError) {
+          extensionContextValid = false;
+        }
+      });
+    } catch (_) {
+      extensionContextValid = false;
+    }
+  };
+
+  const persistOverlayBottom = (value) => {
+    overlayBottomRef.current = value;
+    if (!isContextValid()) return;
+    try {
+      chrome.storage?.local?.set({ [OVERLAY_BOTTOM_KEY]: value }, () => {
+        if (chrome.runtime?.lastError) {
+          extensionContextValid = false;
+        }
+      });
+    } catch (_) {
+      extensionContextValid = false;
+    }
+  };
+  const setOpenPersisted = (value) => {
+    setOpen((prev) => {
+      const next = typeof value === "function" ? value(prev) : value;
+      persistOverlayPreference(next);
+      if (next) {
+        lastInteractionRef.current = Date.now();
+      }
+      return next;
+    });
   };
   const mergePresenceAvatars = (avatarObj = {}) => {
     Object.entries(avatarObj).forEach(([id, url]) => {
@@ -1584,6 +1679,82 @@ function App() {
     }
   };
 
+  const focusChatInput = () => {
+    if (!openRef.current || fullyHiddenRef.current) return;
+    const el = inputRef.current;
+    if (!el || el.disabled) return;
+    if (document.activeElement === el) return;
+    try {
+      el.focus({ preventScroll: true });
+    } catch (_) {
+      try {
+        el.focus();
+      } catch (_) {}
+    }
+  };
+
+  const startResizeTop = (e) => {
+    if (!openRef.current || fullyHiddenRef.current) return;
+    if (!e) return;
+    e.preventDefault?.();
+    e.stopPropagation?.();
+    focusChatInput();
+
+    const startY = e.clientY;
+    const startTop = overlayTopRef.current || 0;
+    const startBottom = overlayBottomRef.current || 0;
+    const minHeight = 420;
+    const vh = window.innerHeight || 0;
+    const maxTop = Math.max(0, vh - startBottom - minHeight);
+
+    const onMove = (ev) => {
+      const delta = (ev?.clientY || 0) - startY;
+      const next = Math.max(0, Math.min(maxTop, startTop + delta));
+      setOverlayTop(next);
+    };
+
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove, true);
+      window.removeEventListener("pointerup", onUp, true);
+      persistOverlayTop(overlayTopRef.current || 0);
+      focusChatInput();
+    };
+
+    window.addEventListener("pointermove", onMove, true);
+    window.addEventListener("pointerup", onUp, true);
+  };
+
+  const startResizeBottom = (e) => {
+    if (!openRef.current || fullyHiddenRef.current) return;
+    if (!e) return;
+    e.preventDefault?.();
+    e.stopPropagation?.();
+    focusChatInput();
+
+    const startY = e.clientY;
+    const startTop = overlayTopRef.current || 0;
+    const startBottom = overlayBottomRef.current || 0;
+    const minHeight = 420;
+    const vh = window.innerHeight || 0;
+    const maxBottom = Math.max(0, vh - startTop - minHeight);
+
+    const onMove = (ev) => {
+      const delta = (ev?.clientY || 0) - startY;
+      const next = Math.max(0, Math.min(maxBottom, startBottom - delta));
+      setOverlayBottom(next);
+    };
+
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove, true);
+      window.removeEventListener("pointerup", onUp, true);
+      persistOverlayBottom(overlayBottomRef.current || 0);
+      focusChatInput();
+    };
+
+    window.addEventListener("pointermove", onMove, true);
+    window.addEventListener("pointerup", onUp, true);
+  };
+
   const scrollMessagesToBottom = (force) => {
     const el = messagesRef.current;
     if (!el) return;
@@ -1591,6 +1762,215 @@ function App() {
       el.scrollTop = el.scrollHeight;
     }
   };
+  const resetInactivityTimer = () => {
+    if (inactivityTimer.current) {
+      clearTimeout(inactivityTimer.current);
+      inactivityTimer.current = null;
+    }
+    if (!openRef.current) return;
+    inactivityTimer.current = setTimeout(() => {
+      const inactiveFor = Date.now() - lastInteractionRef.current;
+      if (openRef.current && inactiveFor >= OVERLAY_INACTIVITY_MS) {
+        setOpenPersisted(false);
+      }
+    }, OVERLAY_INACTIVITY_MS);
+  };
+
+  const hideToast = () => {
+    if (toastHideTimer.current) {
+      clearTimeout(toastHideTimer.current);
+      toastHideTimer.current = null;
+    }
+    setToast(null);
+  };
+
+  const showToast = ({ from, text, ts }) => {
+    if (toastHideTimer.current) clearTimeout(toastHideTimer.current);
+    setToast({ from, text, ts: typeof ts === "number" ? ts : Date.now() });
+    toastHideTimer.current = setTimeout(() => {
+      toastHideTimer.current = null;
+      setToast(null);
+    }, 3500);
+  };
+
+  const persistUnreadCount = (count) => {
+    const roomId = roomRef.current?.roomId;
+    if (!roomId || !isContextValid()) return;
+    const key = unreadKey(roomId);
+    try {
+      chrome.storage?.local?.set({ [key]: Math.max(0, Number(count) || 0) }, () => {
+        if (chrome.runtime?.lastError) {
+          extensionContextValid = false;
+        }
+      });
+    } catch (_) {
+      extensionContextValid = false;
+    }
+  };
+
+  useEffect(() => {
+    try {
+      chrome.storage?.local?.get([OVERLAY_STATE_KEY, OVERLAY_TOP_KEY, OVERLAY_BOTTOM_KEY], (res) => {
+        if (chrome.runtime?.lastError) {
+          extensionContextValid = false;
+          return;
+        }
+        if (typeof res[OVERLAY_STATE_KEY] === "boolean") {
+          overlayPreferenceRef.current = res[OVERLAY_STATE_KEY];
+          setOpen(res[OVERLAY_STATE_KEY]);
+        }
+        if (Number.isFinite(res[OVERLAY_TOP_KEY])) {
+          const nextTop = Math.max(0, Number(res[OVERLAY_TOP_KEY]) || 0);
+          overlayTopRef.current = nextTop;
+          setOverlayTop(nextTop);
+        }
+        if (Number.isFinite(res[OVERLAY_BOTTOM_KEY])) {
+          const nextBottom = Math.max(0, Number(res[OVERLAY_BOTTOM_KEY]) || 0);
+          overlayBottomRef.current = nextBottom;
+          setOverlayBottom(nextBottom);
+        }
+      });
+    } catch (_) {
+      extensionContextValid = false;
+    }
+  }, []);
+
+	  useEffect(() => {
+	    const wasOpen = prevOpenRef.current;
+	    openRef.current = open;
+	    prevOpenRef.current = open;
+	    if (open && !wasOpen) {
+	      setUnreadCount(0);
+	      persistUnreadCount(0);
+	      hideToast();
+	      setTimeout(() => focusChatInput(), 0);
+	    }
+	  }, [open]);
+
+  useEffect(() => {
+    if (open) {
+      lastInteractionRef.current = Date.now();
+      resetInactivityTimer();
+    } else if (inactivityTimer.current) {
+      clearTimeout(inactivityTimer.current);
+      inactivityTimer.current = null;
+    }
+    return () => {
+      if (inactivityTimer.current) {
+        clearTimeout(inactivityTimer.current);
+        inactivityTimer.current = null;
+      }
+    };
+  }, [open]);
+
+  useEffect(() => {
+    sessionRef.current = session;
+  }, [session]);
+
+  useEffect(() => {
+    const wasFullyHidden = prevFullyHiddenRef.current;
+    fullyHiddenRef.current = fullyHidden;
+    prevFullyHiddenRef.current = fullyHidden;
+    if (wasFullyHidden && !fullyHidden && openRef.current) {
+      setUnreadCount(0);
+      persistUnreadCount(0);
+      hideToast();
+      setTimeout(() => focusChatInput(), 0);
+    }
+  }, [fullyHidden]);
+
+  useEffect(() => {
+    overlayTopRef.current = overlayTop;
+    overlayBottomRef.current = overlayBottom;
+    const rootEl = document.getElementById("flixers-react-root");
+    if (!rootEl) return;
+
+    const top = Math.max(0, overlayTop);
+    const bottom = Math.max(0, overlayBottom);
+    rootEl.style.setProperty("--flixers-sidebar-top", `${top}px`);
+    rootEl.style.setProperty("--flixers-sidebar-bottom", `${bottom}px`);
+
+    const updateCenter = () => {
+      const vh = window.innerHeight || 0;
+      const centerY =
+        openRef.current && !fullyHiddenRef.current
+          ? top + Math.max(0, vh - top - bottom) / 2
+          : vh / 2;
+      rootEl.style.setProperty("--flixers-control-center-y", `${centerY}px`);
+    };
+    updateCenter();
+  }, [overlayTop, overlayBottom]);
+
+  useEffect(() => {
+    const rootEl = document.getElementById("flixers-react-root");
+    if (!rootEl) return;
+    const onResize = () => {
+      const vh = window.innerHeight || 0;
+      const top = Math.max(0, overlayTopRef.current || 0);
+      const bottom = Math.max(0, overlayBottomRef.current || 0);
+      const centerY =
+        openRef.current && !fullyHiddenRef.current
+          ? top + Math.max(0, vh - top - bottom) / 2
+          : vh / 2;
+      rootEl.style.setProperty("--flixers-control-center-y", `${centerY}px`);
+    };
+    window.addEventListener("resize", onResize, { passive: true });
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+	  useEffect(() => {
+	    overlayOpenGlobal = !!open && !fullyHidden;
+	    if (!overlayOpenGlobal) return;
+
+	    let interval = null;
+	    const enforceFocus = () => {
+	      if (!openRef.current || fullyHiddenRef.current) return;
+	      const rootEl = document.getElementById("flixers-react-root");
+	      const active = document.activeElement;
+	      const focusedInside = !!rootEl && !!active && rootEl.contains(active);
+	      if (!focusedInside || active !== inputRef.current) {
+	        focusChatInput();
+	      }
+	    };
+
+	    const onFocusIn = () => enforceFocus();
+	    const onPointerDown = () => setTimeout(() => enforceFocus(), 0);
+
+	    document.addEventListener("focusin", onFocusIn, true);
+	    document.addEventListener("pointerdown", onPointerDown, true);
+	    interval = setInterval(enforceFocus, 250);
+	    setTimeout(enforceFocus, 0);
+
+	    return () => {
+	      document.removeEventListener("focusin", onFocusIn, true);
+	      document.removeEventListener("pointerdown", onPointerDown, true);
+	      if (interval) clearInterval(interval);
+	    };
+	  }, [open, fullyHidden]);
+
+  useEffect(() => {
+    let cleanup = null;
+    let retryTimer = null;
+    const attachListeners = () => {
+      const target = document.getElementById("flixers-react-root");
+      if (!target) {
+        retryTimer = setTimeout(attachListeners, 400);
+        return;
+      }
+      const markInteraction = () => {
+        lastInteractionRef.current = Date.now();
+        if (openRef.current) resetInactivityTimer();
+      };
+      const events = ["mousemove", "keydown", "click", "scroll", "touchstart"];
+      events.forEach((evt) => target.addEventListener(evt, markInteraction, { passive: true }));
+      cleanup = () => events.forEach((evt) => target.removeEventListener(evt, markInteraction));
+    };
+    attachListeners();
+    return () => {
+      if (retryTimer) clearTimeout(retryTimer);
+      if (cleanup) cleanup();
+    };
+  }, []);
 
   useEffect(() => {
     injectStyles();
@@ -1736,13 +2116,29 @@ function App() {
       if (message.type === "chat") {
         const fromId = message.fromId || message.from || null;
         if (fromId && message.avatar) setPresenceAvatar(fromId, message.avatar);
-        pushMessage({
+        const didAdd = pushMessage({
           from: message.from || "Anon",
           fromId,
           text: message.text || "",
           ts: message.ts,
           avatar: message.avatar,
         });
+        const currentSession = sessionRef.current;
+        const selfId = currentSession?.profile?.sub || null;
+        const isSelf =
+          (selfId && fromId && String(selfId) === String(fromId)) ||
+          (currentSession?.profile?.name && message.from && currentSession.profile.name === message.from);
+        const isOverlayClosed = !openRef.current || fullyHiddenRef.current;
+        if (didAdd && isOverlayClosed && !isSelf) {
+          setUnreadCount((c) => {
+            const next = c + 1;
+            persistUnreadCount(next);
+            return next;
+          });
+          const text = (message.text || "").trim();
+          const clipped = text.length > 120 ? `${text.slice(0, 117)}…` : text;
+          showToast({ from: message.from || "Anon", text: clipped, ts: message.ts });
+        }
         // Force scroll to bottom when receiving a message
         setTimeout(() => scrollMessagesToBottom(true), 50);
       }
@@ -1788,7 +2184,9 @@ function App() {
         if (message.roomId) {
           setRoomEndNoticeSafe(null);
           // Auto-open overlay when joining a room
-          setOpen(true);
+          const preferOpen =
+            typeof overlayPreferenceRef.current === "boolean" ? overlayPreferenceRef.current : true;
+          setOpenPersisted(preferOpen);
           // Scroll to bottom after messages load
           setTimeout(() => scrollMessagesToBottom(true), 100);
           // Note: Don't auto-trigger resync here - let the natural flow handle it
@@ -1826,7 +2224,9 @@ function App() {
           lastTyping.current = {};
           setConnection("disconnected");
           setFullyHidden(false);
-          setOpen(true);
+          const preferOpen =
+            typeof overlayPreferenceRef.current === "boolean" ? overlayPreferenceRef.current : true;
+          setOpenPersisted(preferOpen);
           seenMessages.current.clear();
           setMessages([{ type: "system", text: notice.text, ts: notice.ts }]);
           setTimeout(() => scrollMessagesToBottom(true), 50);
@@ -1985,13 +2385,14 @@ function App() {
 
   const pushMessage = (msg) => {
     const key = `${msg.fromId || msg.from || "anon"}-${msg.ts || Date.now()}-${msg.text || ""}`;
-    if (seenMessages.current.has(key)) return;
+    if (seenMessages.current.has(key)) return false;
     seenMessages.current.add(key);
     setMessages((prev) => {
       const next = [...prev, msg].slice(-500);
       persistMessages(next);
       return next;
     });
+    return true;
   };
 
   const resetChatState = () => {
@@ -1999,6 +2400,9 @@ function App() {
     seenMessages.current.clear();
     setTyping({});
     lastTyping.current = {};
+    setUnreadCount(0);
+    persistUnreadCount(0);
+    hideToast();
     scrollMessagesToBottom(true);
   };
 
@@ -2072,16 +2476,18 @@ function App() {
     if (!roomId || !isContextValid()) return;
     const key = storageKey(roomId);
     try {
-      chrome.storage?.local?.get([key], (res) => {
+      chrome.storage?.local?.get([key, unreadKey(roomId)], (res) => {
         if (chrome.runtime?.lastError) {
           extensionContextValid = false;
           return;
         }
         const list = Array.isArray(res[key]) ? res[key] : [];
+        const unread = Math.max(0, Number(res[unreadKey(roomId)]) || 0);
         seenMessages.current = new Set(
           list.map((m) => `${m.fromId || m.from || "anon"}-${m.ts || ""}-${m.text || ""}`)
         );
         setMessages(list.slice(-200));
+        setUnreadCount(unread);
         scrollMessagesToBottom(true);
       });
     } catch (_) {
@@ -2128,6 +2534,17 @@ function App() {
   // Position changes based on whether chat panel is open
   // Auto-hides after 3 seconds when chat is closed, reappears on mouse move
   const controlBarClasses = `flixers-control-bar ${open ? "" : "flixers-control-bar--collapsed"} ${!controlBarVisible && !open ? "flixers-control-bar--autohidden" : ""}`;
+  const isOverlayClosed = !open || fullyHidden;
+  const unreadLabel = unreadCount > 99 ? "99+" : String(unreadCount);
+  const toastEl =
+    isOverlayClosed && toast
+      ? html`<div class="flixers-toast-host" aria-live="polite" aria-atomic="true">
+          <div class="flixers-toast">
+            <div class="flixers-toast-title">${toast.from}</div>
+            <div class="flixers-toast-body">${toast.text}</div>
+          </div>
+        </div>`
+      : null;
   
   const controlBar = fullyHidden
     ? null
@@ -2135,11 +2552,13 @@ function App() {
         <button 
           class="flixers-control-btn flixers-control-btn--chat"
           aria-label=${open ? "Hide chat" : "Show chat"}
-          onClick=${() => setOpen(!open)}
+          onClick=${() => setOpenPersisted((prev) => !prev)}
           title=${open ? "Hide chat" : "Show chat"}
         >
           <span class="flixers-control-icon">${open ? "✕" : "💬"}</span>
-          ${!open && messages.length > 0 ? html`<span class="flixers-control-badge"></span>` : null}
+          ${!open && unreadCount > 0
+            ? html`<span class="flixers-control-badge" aria-label=${`${unreadCount} unread messages`}>${unreadLabel}</span>`
+            : null}
         </button>
       </div>`;
 
@@ -2151,11 +2570,12 @@ function App() {
         onKeyUp=${stopKeyboardPropagation}
         onKeyPress=${stopKeyboardPropagation}
       >
-        <div class="flixers-panel">
-          <div class="flixers-header">
-            <div>
-              <div class="flixers-title">Live Chat</div>
-              <div class="flixers-room">
+	        <div class="flixers-panel">
+	          <div class="flixers-resize-handle" title="Drag to resize height" onPointerDown=${startResizeTop}></div>
+	          <div class="flixers-header">
+	            <div>
+	              <div class="flixers-title">Live Chat</div>
+	              <div class="flixers-room">
                 ${room.roomId ? `Room ${room.roomId}` : "Not joined"}
               </div>
             </div>
@@ -2217,29 +2637,33 @@ function App() {
             )}
           </div>
           <${TypingIndicator} typing=${activeTyping} />
-          <form class="flixers-input-row" onSubmit=${handleSubmit}>
-            <input
-              type="text"
-              placeholder=${connection === "connected" ? "Send a message" : "Message will be sent when connected..."}
-              value=${input}
-              onInput=${(e) => handleInput(e.target.value)}
-              onKeyDown=${stopKeyboardPropagation}
-              onKeyUp=${stopKeyboardPropagation}
-              onKeyPress=${stopKeyboardPropagation}
-              disabled=${!room.roomId}
-            />
-            <button type="submit" disabled=${!room.roomId || !input.trim()}>${connection === "connected" ? "Send" : "Queue"}</button>
-          </form>
-        </div>
-      </div>`;
+	          <form class="flixers-input-row" onSubmit=${handleSubmit}>
+	            <input
+	              ref=${inputRef}
+	              type="text"
+	              placeholder=${connection === "connected" ? "Send a message" : "Message will be sent when connected..."}
+	              value=${input}
+	              onInput=${(e) => handleInput(e.target.value)}
+	              onKeyDown=${stopKeyboardPropagation}
+	              onKeyUp=${stopKeyboardPropagation}
+	              onKeyPress=${stopKeyboardPropagation}
+	              onFocus=${() => resetInactivityTimer()}
+	              disabled=${!room.roomId}
+	            />
+	            <button type="submit" disabled=${!room.roomId || !input.trim()}>${connection === "connected" ? "Send" : "Queue"}</button>
+	          </form>
+	          <div class="flixers-resize-handle flixers-resize-handle--bottom" title="Drag to resize height" onPointerDown=${startResizeBottom}></div>
+	        </div>
+	      </div>`;
 
-  return html`
-    ${controlBar}
-    ${overlay}
-    <button
-      class=${`flixers-reopen ${fullyHidden ? "" : "flixers-reopen--hidden"}`}
-      aria-label="Show Flixers"
-      onClick=${() => { setFullyHidden(false); setOpen(true); }}
+	  return html`
+	    ${toastEl}
+	    ${controlBar}
+	    ${overlay}
+	    <button
+	      class=${`flixers-reopen ${fullyHidden ? "" : "flixers-reopen--hidden"}`}
+	      aria-label="Show Flixers"
+      onClick=${() => { setFullyHidden(false); setOpenPersisted(true); }}
     >
       💬 Flixers
     </button>
@@ -2280,6 +2704,14 @@ const setupKeyboardBlocker = () => {
       if (!isInput && blockedKeys.has(e.key)) {
         e.preventDefault();
       }
+      return;
+    }
+
+    // If overlay is open but focus escaped, block Netflix shortcut keys anyway.
+    if (overlayOpenGlobal && blockedKeys.has(e.key)) {
+      e.preventDefault();
+      e.stopPropagation();
+      e.stopImmediatePropagation();
     }
   };
   
@@ -2460,8 +2892,11 @@ function injectStyles() {
     .flixers-overlay .flixers-input-row { flex-shrink: 0; }
     .flixers-hidden { transform: translateX(calc(var(--flixers-sidebar-width) + 50px)); opacity: 0; pointer-events: none; }
     .flixers-hidden .flixers-panel { pointer-events: none; }
-    .flixers-panel { background: linear-gradient(180deg, #0d1323 0%, #0a0f1a 100%); border: 1px solid rgba(255,255,255,0.08); border-radius: 16px; box-shadow: 0 18px 48px rgba(0,0,0,0.45); padding: 14px; backdrop-filter: blur(12px); box-sizing: border-box; }
-    .flixers-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; margin-bottom: 6px; }
+	    .flixers-panel { background: linear-gradient(180deg, #0d1323 0%, #0a0f1a 100%); border: 1px solid rgba(255,255,255,0.08); border-radius: 16px; box-shadow: 0 18px 48px rgba(0,0,0,0.45); padding: 14px; padding-bottom: 42px; backdrop-filter: blur(12px); box-sizing: border-box; position: relative; }
+	    .flixers-resize-handle { height: 10px; margin: 0 0 10px; border-radius: 10px; background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.08); cursor: ns-resize; position: relative; width: 100%; flex-shrink: 0; }
+	    .flixers-resize-handle::after { content: ""; position: absolute; left: 50%; top: 50%; width: 44px; height: 2px; background: rgba(255,255,255,0.22); border-radius: 999px; transform: translate(-50%, -50%); }
+	    .flixers-resize-handle--bottom { position: absolute; left: 14px; right: 14px; bottom: 12px; margin: 0; z-index: 2; }
+	    .flixers-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; margin-bottom: 6px; }
     .flixers-header-right { display: flex; align-items: center; gap: 8px; }
     .flixers-title { font-weight: 800; letter-spacing: 0.4px; font-size: 16px; text-transform: uppercase; color: #c7d3ff; }
     .flixers-room { font-size: 13px; color: #94a3b8; }
@@ -2484,33 +2919,35 @@ function injectStyles() {
     .flixers-resync:hover { background: rgba(110, 242, 196, 0.25); }
     .flixers-clear { background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1); color: #e5edff; padding: 7px 12px; border-radius: 12px; cursor: pointer; font-size: 12px; font-weight: 600; }
     .flixers-messages { height: 240px; overflow-y: auto; border: 1px solid rgba(255,255,255,0.06); border-radius: 12px; padding: 10px; background: rgba(6,10,20,0.7); font-size: 13px; display: flex; flex-direction: column; gap: 8px; }
-    .flixers-message { display: grid; grid-template-columns: 34px 1fr; gap: 8px; padding: 8px 10px; border-radius: 10px; border: 1px solid rgba(255,255,255,0.05); background: linear-gradient(145deg, rgba(20,26,42,0.95), rgba(15,20,32,0.92)); box-shadow: 0 6px 18px rgba(0,0,0,0.28); }
-    .flixers-message--right { grid-template-columns: 1fr; text-align: right; }
-    .flixers-message--left { grid-template-columns: 34px 1fr; }
-    .flixers-message--right .flixers-message__text { text-align: left; }
-    .flixers-message__meta { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; color: #a5b4fc; font-size: 12px; justify-content: flex-start; }
-    .flixers-message__meta--right { justify-content: flex-end; gap: 8px; }
-    .flixers-message__footer { display: flex; justify-content: flex-start; margin-top: 8px; }
-    .flixers-message__footer--right { justify-content: flex-end; }
-    .flixers-avatar { width: 32px; height: 32px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; font-size: 15px; font-weight: 700; background-size: cover; background-position: center; }
+    .flixers-message { display: flex; gap: 8px; align-items: flex-end; max-width: 100%; }
+    .flixers-message__body { position: relative; padding: 8px 10px 6px; border-radius: 14px 14px 14px 6px; border: 1px solid rgba(255,255,255,0.06); background: linear-gradient(145deg, rgba(20,26,42,0.95), rgba(15,20,32,0.92)); box-shadow: 0 4px 12px rgba(0,0,0,0.22); min-width: 0; max-width: 78%; }
+    .flixers-message__body::after { content: ""; position: absolute; bottom: 0; left: -5px; width: 10px; height: 14px; background: inherit; border-bottom-left-radius: 9px; clip-path: polygon(100% 0, 0 50%, 100% 100%); opacity: 0.95; }
+    .flixers-message--own { flex-direction: row-reverse; }
+    .flixers-message--own .flixers-message__body { border-radius: 14px 14px 6px 14px; margin-left: auto; }
+    .flixers-message--own .flixers-message__body::after { left: auto; right: -5px; transform: scaleX(-1); }
+    .flixers-message__meta { display: flex; align-items: center; gap: 5px; margin-bottom: 2px; color: #a5b4fc; font-size: 11px; justify-content: flex-start; }
+    .flixers-message--own .flixers-message__meta { justify-content: flex-end; }
+    .flixers-message__footer { display: flex; justify-content: flex-end; margin-top: 4px; font-size: 11px; }
+    .flixers-message--own .flixers-message__footer { justify-content: flex-end; }
+    .flixers-avatar { width: 30px; height: 30px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 700; background-size: cover; background-position: center; }
     .flixers-avatar--image { background-size: cover; background-position: center; }
     .flixers-from { font-weight: 700; color: #ffb86c; }
     .flixers-time { color: #94a3b8; }
     .flixers-pending { color: #ffb27a; font-size: 11px; font-style: italic; }
     .flixers-message--pending { opacity: 0.7; border-style: dashed; }
-    /* Own messages match the same bubble style as others (layout still right-aligned). */
-    .flixers-message--own { border-color: rgba(255,255,255,0.05); background: linear-gradient(145deg, rgba(20,26,42,0.95), rgba(15,20,32,0.92)); }
     .flixers-message--own .flixers-from { color: #ffb86c; }
     .flixers-message--own .flixers-time { color: #94a3b8; }
     .flixers-message--own .flixers-avatar { box-shadow: none; }
-    .flixers-message__footer { display: flex; justify-content: flex-end; margin-top: 6px; }
-    .flixers-message__text { color: #f8fafc; line-height: 1.5; word-break: break-word; }
-    .flixers-input-row { display: grid; grid-template-columns: 1fr 96px; gap: 10px; margin-top: 12px; }
-    .flixers-input-row input { border-radius: 12px; border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.06); color: #f8fafc; padding: 13px; font-size: 14px; }
-    .flixers-input-row button { border: none; border-radius: 12px; background: linear-gradient(135deg, #ff6f61, #ffb27a); color: #0f1117; font-weight: 800; cursor: pointer; box-shadow: 0 12px 28px rgba(255, 179, 122, 0.35); font-size: 14px; }
-    .flixers-toggle-row { display: flex; gap: 10px; margin-bottom: 12px; justify-content: flex-end; align-items: center; }
-    .flixers-toggle-row--top { position: sticky; top: 0; z-index: 2; }
-    .flixers-toggle { flex: 0 0 auto; background: rgba(255,255,255,0.12); color: #f8fafc; border: 1px solid rgba(255,255,255,0.18); border-radius: 12px; padding: 10px 12px; cursor: pointer; font-weight: 700; font-size: 14px; letter-spacing: 0.02em; display: inline-flex; align-items: center; justify-content: center; gap: 8px; }
+    .flixers-message__text { color: #f8fafc; line-height: 1.45; word-break: break-word; }
+	    .flixers-input-row { display: grid; grid-template-columns: 1fr 96px; gap: 10px; margin-top: 12px; }
+	    .flixers-input-row input { border-radius: 12px; border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.06); color: #f8fafc; padding: 13px; font-size: 14px; min-height: 44px; box-sizing: border-box; }
+	    .flixers-input-row button { border: 1px solid rgba(255,255,255,0.12); border-radius: 12px; background: #0f1524; color: #e5edff; font-weight: 800; cursor: pointer; box-shadow: none; font-size: 14px; padding: 0 14px; min-height: 44px; transition: background 0.15s ease, border-color 0.15s ease, transform 0.08s ease, opacity 0.15s ease; }
+	    .flixers-input-row button:hover:not(:disabled) { background: #111a2b; border-color: rgba(255,255,255,0.2); }
+	    .flixers-input-row button:active:not(:disabled) { transform: translateY(1px); }
+	    .flixers-input-row button:disabled { opacity: 0.55; cursor: not-allowed; transform: none; }
+	    .flixers-toggle-row { display: flex; gap: 10px; margin-bottom: 12px; justify-content: flex-end; align-items: center; }
+	    .flixers-toggle-row--top { position: sticky; top: 0; z-index: 2; }
+	    .flixers-toggle { flex: 0 0 auto; background: rgba(255,255,255,0.12); color: #f8fafc; border: 1px solid rgba(255,255,255,0.18); border-radius: 12px; padding: 10px 12px; cursor: pointer; font-weight: 700; font-size: 14px; letter-spacing: 0.02em; display: inline-flex; align-items: center; justify-content: center; gap: 8px; }
     .flixers-toggle--ghost { background: rgba(255,255,255,0.04); border-color: rgba(255,255,255,0.12); color: #c7d3ff; }
     .flixers-typing { margin: 6px 0; font-size: 13px; color: #9aa5c4; }
     .flixers-system-message { text-align: center; padding: 8px 12px; color: #9aa5c4; font-size: 12px; border-bottom: 1px solid rgba(255,255,255,0.04); }
@@ -2518,7 +2955,7 @@ function injectStyles() {
     .flixers-system-time { color: #64748b; font-size: 11px; }
     
     /* Sidebar mode styles */
-    .flixers-overlay.flixers-sidebar { position: fixed; right: 0; top: 0; bottom: 0; width: var(--flixers-sidebar-width); height: 100%; max-height: 100vh; border-radius: 0; padding: 12px var(--flixers-sidebar-gutter); margin: 0; gap: 12px; }
+	    .flixers-overlay.flixers-sidebar { position: fixed; right: 0; top: var(--flixers-sidebar-top, 0px); bottom: var(--flixers-sidebar-bottom, 0px); width: var(--flixers-sidebar-width); max-height: 100vh; border-radius: 0; padding: 12px var(--flixers-sidebar-gutter); margin: 0; gap: 12px; }
     .flixers-overlay.flixers-sidebar .flixers-panel { height: 100%; max-height: 100vh; border-radius: 0; display: flex; flex-direction: column; box-sizing: border-box; overflow: hidden; }
     .flixers-overlay.flixers-sidebar .flixers-messages { flex: 1; height: auto; min-height: 100px; overflow-y: auto; }
     .flixers-overlay.flixers-sidebar .flixers-toggle-row { flex-shrink: 0; }
@@ -2534,20 +2971,27 @@ function injectStyles() {
     .flixers-reopen--hidden { display: none; }
     
     /* Control bar - single chat toggle button on the right side */
-    .flixers-control-bar { position: fixed; top: 50%; right: calc(var(--flixers-sidebar-width) + 12px); transform: translateY(-50%); z-index: 2147483647 !important; display: flex; padding: 0; background: transparent; border: none; box-shadow: none; transition: right 0.3s ease, opacity 0.3s ease, transform 0.3s ease; pointer-events: auto !important; }
+	    .flixers-control-bar { position: fixed; top: var(--flixers-control-center-y, 50%); right: calc(var(--flixers-sidebar-width) + 12px); transform: translateY(-50%); z-index: 2147483647 !important; display: flex; padding: 0; background: transparent; border: none; box-shadow: none; transition: right 0.3s ease, opacity 0.3s ease, transform 0.3s ease; pointer-events: auto !important; }
     .flixers-control-bar.flixers-control-bar--collapsed { right: 24px; }
     .flixers-control-bar.flixers-control-bar--autohidden { opacity: 0; transform: translateY(-50%) translateX(20px); pointer-events: none; }
     .flixers-control-btn { width: 48px; height: 48px; border-radius: 50%; border: 1px solid rgba(255,255,255,0.2); background: rgba(0,0,0,0.75); backdrop-filter: blur(8px); color: #f8fafc; display: flex; align-items: center; justify-content: center; cursor: pointer !important; transition: all 0.2s ease; position: relative; pointer-events: auto !important; -webkit-user-select: none; user-select: none; box-shadow: 0 4px 16px rgba(0,0,0,0.4); }
     .flixers-control-btn:hover { background: rgba(0,0,0,0.9); border-color: rgba(255,255,255,0.35); transform: scale(1.1); box-shadow: 0 6px 20px rgba(0,0,0,0.5); }
     .flixers-control-btn:active { transform: scale(0.95); }
-    .flixers-control-btn--chat { background: rgba(0,0,0,0.75); }
-    .flixers-control-btn--chat:hover { background: rgba(0,0,0,0.9); }
-    .flixers-control-icon { font-size: 22px; line-height: 1; pointer-events: none; }
-    .flixers-control-badge { position: absolute; top: 4px; right: 4px; width: 10px; height: 10px; border-radius: 50%; background: linear-gradient(135deg, #ff6f61, #ffb27a); box-shadow: 0 0 8px rgba(255,111,97,0.6); animation: flixers-pulse 2s ease-in-out infinite; pointer-events: none; }
-    @keyframes flixers-pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.7; transform: scale(1.2); } }
-    
-    /* Netflix video container adjustments for sidebar mode */
-    .flixers-sidebar-active { width: 100% !important; margin: 0 !important; transition: width 0.3s ease !important; position: relative; }
+	    .flixers-control-btn--chat { background: rgba(0,0,0,0.75); }
+	    .flixers-control-btn--chat:hover { background: rgba(0,0,0,0.9); }
+	    .flixers-control-icon { font-size: 22px; line-height: 1; pointer-events: none; }
+	    .flixers-control-badge { position: absolute; top: 2px; right: 2px; min-width: 18px; height: 18px; border-radius: 999px; padding: 0 5px; display: inline-flex; align-items: center; justify-content: center; background: linear-gradient(135deg, #ff6f61, #ffb27a); box-shadow: 0 0 10px rgba(255,111,97,0.65); animation: flixers-pulse 2s ease-in-out infinite; pointer-events: none; color: #0f1117; font-size: 11px; font-weight: 900; line-height: 1; }
+	    @keyframes flixers-pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.7; transform: scale(1.2); } }
+
+	    /* Toast notifications (only when chat is closed) */
+	    .flixers-toast-host { position: fixed; top: 18px; left: 50%; transform: translateX(-50%); z-index: var(--flixers-z-max) !important; pointer-events: none; width: min(440px, calc(100vw - 28px)); }
+	    .flixers-toast { background: rgba(9, 12, 20, 0.78); border: 1px solid rgba(255,255,255,0.12); backdrop-filter: blur(12px); color: #e5edff; border-radius: 14px; padding: 10px 12px; box-shadow: 0 12px 40px rgba(0,0,0,0.5); animation: flixers-toast-in 220ms ease-out; }
+	    .flixers-toast-title { font-weight: 900; font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: #ffb27a; margin-bottom: 2px; }
+	    .flixers-toast-body { font-size: 13px; color: #f8fafc; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+	    @keyframes flixers-toast-in { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: translateY(0); } }
+	    
+	    /* Netflix video container adjustments for sidebar mode */
+	    .flixers-sidebar-active { width: 100% !important; margin: 0 !important; transition: width 0.3s ease !important; position: relative; }
     .flixers-sidebar-active video { object-fit: contain !important; }
     body.flixers-sidebar-mode { box-sizing: border-box; }
     body.flixers-sidebar-mode .watch-video,
@@ -2568,8 +3012,8 @@ function injectStyles() {
     :-webkit-full-screen .flixers-sidebar-active video { width: 100% !important; height: 100% !important; object-fit: contain !important; }
     :fullscreen .flixers-overlay,
     :-webkit-full-screen .flixers-overlay { position: fixed !important; z-index: 2147483647 !important; top: 0; right: 0; bottom: 0; left: auto; height: 100%; width: var(--flixers-sidebar-width); pointer-events: auto !important; isolation: isolate; margin: 0 !important; }
-    :fullscreen .flixers-overlay.flixers-sidebar,
-    :-webkit-full-screen .flixers-overlay.flixers-sidebar { position: fixed !important; height: 100%; }
+	    :fullscreen .flixers-overlay.flixers-sidebar,
+	    :-webkit-full-screen .flixers-overlay.flixers-sidebar { position: fixed !important; top: var(--flixers-sidebar-top, 0px) !important; bottom: 0 !important; height: auto !important; }
     :fullscreen .flixers-reopen,
     :-webkit-full-screen .flixers-reopen { position: fixed !important; top: 50% !important; right: 24px !important; z-index: 2147483647 !important; pointer-events: auto !important; }
     :fullscreen .flixers-control-bar,

@@ -18,9 +18,9 @@ if (!process.env.JEST_WORKER_ID) {
 }
 
 const PORT = process.env.PORT || 4000;
-const JWT_SECRET = process.env.JWT_SECRET;
-const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
 const NODE_ENV = process.env.NODE_ENV || "development";
+const JWT_SECRET = process.env.JWT_SECRET || (NODE_ENV === "production" ? null : "dev-secret");
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
 
 // Validate required environment variables in production
 if (NODE_ENV === "production") {
@@ -67,6 +67,13 @@ function formatRoomCleanupDelay(ms) {
     return `${hours} hour${hours === 1 ? "" : "s"}`;
   }
   return `${minutes} min`;
+}
+
+function isValidRoomId(roomId) {
+  if (!roomId || typeof roomId !== "string") return false;
+  const trimmed = roomId.trim();
+  if (trimmed.length < 3 || trimmed.length > 64) return false;
+  return /^[A-Za-z0-9_-]+$/.test(trimmed);
 }
 
 // Health check endpoint
@@ -138,18 +145,23 @@ app.post("/rooms", authRequired, async (req, res) => {
 
 app.post("/rooms/:id/join", authRequired, async (req, res) => {
   const { id } = req.params;
+  const roomId = (id || "").trim();
+  
+  if (!isValidRoomId(roomId)) {
+    return res.status(400).json({ error: "invalid_room_id" });
+  }
   
   // Try Redis first, then memory
   let roomData = null;
   if (redis && redis.isRedisConnected()) {
     try {
-      roomData = await redis.getRoom(id);
+      roomData = await redis.getRoom(roomId);
     } catch (err) {
       console.warn("[Redis] Failed to get room:", err.message);
     }
   }
   
-  const room = rooms.get(id);
+  const room = rooms.get(roomId);
   if (!room && !roomData) {
     return res.status(404).json({ error: "Room not found" });
   }
@@ -161,7 +173,7 @@ app.post("/rooms/:id/join", authRequired, async (req, res) => {
   const encryptionRequired = room?.encryptionRequired ?? roomData?.encryptionRequired ?? false;
   
   res.json({
-    roomId: id,
+    roomId,
     name: req.user?.name || "Guest",
     encryptionRequired,
     videoUrl,
@@ -173,18 +185,23 @@ app.post("/rooms/:id/join", authRequired, async (req, res) => {
 // Preview room info without joining (for confirmation step)
 app.get("/rooms/:id/preview", authRequired, async (req, res) => {
   const { id } = req.params;
+  const roomId = (id || "").trim();
+  
+  if (!isValidRoomId(roomId)) {
+    return res.status(400).json({ error: "invalid_room_id" });
+  }
   
   // Try Redis first, then memory
   let roomData = null;
   if (redis && redis.isRedisConnected()) {
     try {
-      roomData = await redis.getRoom(id);
+      roomData = await redis.getRoom(roomId);
     } catch (err) {
       console.warn("[Redis] Failed to get room for preview:", err.message);
     }
   }
   
-  const room = rooms.get(id);
+  const room = rooms.get(roomId);
   if (!room && !roomData) {
     return res.status(404).json({ error: "Room not found" });
   }
@@ -195,7 +212,7 @@ app.get("/rooms/:id/preview", authRequired, async (req, res) => {
   const participantCount = room?.clients?.size || 0;
   
   res.json({
-    roomId: id,
+    roomId,
     videoUrl,
     titleId,
     initialTime,
@@ -260,10 +277,10 @@ wss.on("close", () => {
 
 wss.on("connection", (socket, req) => {
   const params = new URL(req.url, `http://${req.headers.host}`).searchParams;
-  const roomId = params.get("roomId");
   const token = params.get("token");
+  const roomId = (params.get("roomId") || "").trim();
 
-  if (!roomId || !token) {
+  if (!roomId || !token || !isValidRoomId(roomId)) {
     socket.close();
     return;
   }
@@ -356,7 +373,17 @@ wss.on("connection", (socket, req) => {
   });
 });
 
-function start(port = PORT) {
+async function start(port = PORT) {
+  // Connect to Redis if available
+  if (redis && typeof redis.connect === "function") {
+    try {
+      await redis.connect();
+      console.log("[Redis] Connection initiated");
+    } catch (err) {
+      console.warn("[Redis] Failed to connect:", err.message);
+    }
+  }
+  
   startPingInterval();
   return server.listen(port, () => {
     console.log(`API listening on :${port}`);
@@ -391,7 +418,10 @@ function stop(cb) {
 }
 
 if (require.main === module) {
-  start();
+  start().catch((err) => {
+    console.error("Failed to start server:", err);
+    process.exit(1);
+  });
 }
 
 function ensureRoom(roomId, opts = {}) {

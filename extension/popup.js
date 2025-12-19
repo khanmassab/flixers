@@ -1,5 +1,5 @@
 // Popup logic for Flixers
-const API_BASE = "http://16.170.150.83";
+const API_BASE = "http://localhost:4000";
 const GOOGLE_CLIENT_ID = "400373504190-dasf4eoqp7oqaikurtq9b9gqi32oai6t.apps.googleusercontent.com";
 // chrome.identity.getRedirectURL() respects the runtime ID for this profile, avoiding mismatches.
 const REDIRECT_URI = `https://${chrome.runtime.id}.chromiumapp.org/`;
@@ -14,6 +14,9 @@ const userNameEl = document.getElementById("user-name");
 const userEmailEl = document.getElementById("user-email");
 const signInBtn = document.getElementById("signin");
 const signOutBtn = document.getElementById("signout");
+const createBtn = document.getElementById("create");
+const copyIdBtn = document.getElementById("copy-room-id");
+const leaveBtn = document.getElementById("leave");
 
 const state = {
   roomId: null,
@@ -31,8 +34,7 @@ const state = {
 signInBtn.addEventListener("click", handleSignIn);
 signOutBtn.addEventListener("click", handleSignOut);
 
-document.getElementById("create").addEventListener("click", async () => {
-  const createBtn = document.getElementById("create");
+createBtn?.addEventListener("click", async () => {
   const originalText = createBtn.textContent;
   
   // Check if user is on a Netflix video page
@@ -67,26 +69,36 @@ document.getElementById("create").addEventListener("click", async () => {
         videoTime: videoState?.t || 0,
       }),
     });
-    if (!res.ok) throw new Error("create failed");
-    const data = await res.json();
-    const shareLink = buildShareLink(data.roomId);
-    roomLinkInput.value = shareLink;
-    try {
-      await navigator.clipboard.writeText(shareLink);
-      pushToast("Room link copied", "info");
-    } catch (_) {
-      // Clipboard may fail in some contexts; ignore
+    if (res.status === 401) {
+      await handleAuthExpired();
+      throw new Error("auth-required");
     }
+    if (!res.ok) {
+      const error = await res.json().catch(() => ({}));
+      throw new Error(error.error || "create_failed");
+    }
+    const data = await res.json();
+    roomLinkInput.value = data.roomId;
+    await copyRoomIdToClipboard(data.roomId);
     await joinRoom(data.roomId);
     pushToast(`New room created (${data.roomId})`, "info");
   } catch (err) {
+    const reason = err?.message || "create_failed";
+    if (reason === "auth-required") {
+      pushToast("Sign in to create a room", "warn");
+    } else {
+      pushToast("Could not create room", "warn");
+    }
     setStatus("Failed to create room");
-    pushToast("Could not create room", "warn");
   } finally {
     lockControls(false);
     createBtn.textContent = originalText;
     createBtn.classList.remove("loading");
   }
+});
+
+copyIdBtn?.addEventListener("click", async () => {
+  await copyRoomIdToClipboard(state.roomId || roomLinkInput.value);
 });
 
 // Get current video state from Netflix tab
@@ -124,7 +136,7 @@ roomLinkInput.addEventListener("paste", async (e) => {
     } else if (!/^[a-zA-Z0-9_-]+$/.test(text) && !text.includes("room=")) {
       pushToast("Room ID can only contain letters, numbers, hyphens, underscores", "warn");
     } else {
-      pushToast("Invalid room link or ID", "warn");
+      pushToast("Invalid room ID", "warn");
     }
     return;
   }
@@ -154,6 +166,10 @@ async function previewRoom(roomId) {
       },
     });
     
+    if (res.status === 401) {
+      await handleAuthExpired();
+      return;
+    }
     if (!res.ok) {
       if (res.status === 404) {
         throw new Error("Room expired");
@@ -269,7 +285,10 @@ async function confirmJoinRoom(roomId, videoUrl, initialTime) {
     });
     
     if (!res?.ok) {
-      const reason = res?.reason === "auth-required" ? "Sign in first" : "Join failed";
+      const reason = res?.reason || "join_failed";
+      if (reason === "auth-required") {
+        await handleAuthExpired();
+      }
       throw new Error(reason);
     }
     
@@ -278,16 +297,23 @@ async function confirmJoinRoom(roomId, videoUrl, initialTime) {
     setConnectionPill("bad", "connecting");
     pushToast(`Joining ${roomId} as ${displayName}`, "info");
   } catch (err) {
+    const msg = err?.message || "join_failed";
     setStatus("Failed to join room");
     setConnectionPill("idle", "Idle");
     jitterInput(roomLinkInput);
-    pushToast("Could not join room", "warn");
+    if (msg === "auth-required") {
+      pushToast("Sign in to join rooms", "warn");
+    } else if (msg === "invalid-room") {
+      pushToast("Invalid room ID", "warn");
+    } else {
+      pushToast("Could not join room", "warn");
+    }
   } finally {
     lockControls(false);
   }
 }
 
-document.getElementById("leave").addEventListener("click", async () => {
+leaveBtn?.addEventListener("click", async () => {
   try {
     await chrome.runtime.sendMessage({ type: "leave-room" });
   } catch (_) {
@@ -509,7 +535,7 @@ function applySession(session) {
   signInBtn.disabled = authed;
   signOutBtn.classList.toggle("hidden", !authed);
   signInBtn.classList.toggle("hidden", authed);
-  document.getElementById("create").disabled = !authed;
+  createBtn.disabled = !authed;
   updateVisibility();
 }
 
@@ -525,8 +551,8 @@ async function joinRoom(roomId) {
   const session = requireSession();
   if (!session) return;
   if (!roomId) {
-    setStatus("Paste a room link first");
-    pushToast("Paste a room link first", "warn");
+    setStatus("Enter a room ID first");
+    pushToast("Enter a room ID first", "warn");
     return;
   }
   lockControls(true);
@@ -552,7 +578,10 @@ async function joinRoom(roomId) {
       );
     });
     if (!res?.ok) {
-      const reason = res?.reason === "auth-required" ? "Sign in first" : "Join failed";
+      const reason = res?.reason || "join_failed";
+      if (reason === "auth-required") {
+        await handleAuthExpired();
+      }
       throw new Error(reason);
     }
     setRoom(roomId, displayName);
@@ -560,10 +589,17 @@ async function joinRoom(roomId) {
     setConnectionPill("bad", "connecting");
     pushToast(`Joining ${roomId} as ${displayName}`, "info");
   } catch (err) {
+    const msg = err?.message || "join_failed";
+    if (msg === "auth-required") {
+      pushToast("Sign in to join rooms", "warn");
+    } else if (msg === "invalid-room") {
+      pushToast("Invalid room ID", "warn");
+    } else {
+      pushToast("Could not join room", "warn");
+    }
     setStatus("Failed to join room");
     setConnectionPill("idle", "Idle");
     jitterInput(roomLinkInput);
-    pushToast("Could not join room", "warn");
   } finally {
     lockControls(false);
   }
@@ -589,9 +625,11 @@ function setConnectionPill(kind, text) {
 
 function lockControls(disabled) {
   const authed = !!state.session;
-  document.getElementById("create").disabled = disabled || !authed;
-  document.getElementById("leave").disabled = disabled;
-  roomLinkInput.disabled = disabled;
+  const inRoom = !!state.roomId;
+  createBtn.disabled = disabled || !authed || inRoom;
+  leaveBtn.disabled = disabled || !inRoom;
+  copyIdBtn.disabled = disabled || !inRoom;
+  roomLinkInput.disabled = disabled || inRoom;
 }
 
 function renderPresence(participants) {
@@ -614,7 +652,7 @@ function renderPresence(participants) {
 function setRoom(roomId, name = state.session?.profile?.name) {
   state.roomId = roomId;
   state.roomName = name || "Guest";
-  roomLinkInput.value = roomId ? buildShareLink(roomId) : "";
+  roomLinkInput.value = roomId ? roomId : "";
   if (roomId) {
     setStatus(`Reattached to room ${roomId}`);
   } else {
@@ -623,28 +661,22 @@ function setRoom(roomId, name = state.session?.profile?.name) {
   updateVisibility();
 }
 
-function buildShareLink(roomId) {
-  return `chrome-extension://${chrome.runtime.id}/popup.html?room=${encodeURIComponent(
-    roomId
-  )}`;
-}
-
 function updateVisibility() {
   const inRoom = !!state.roomId;
   const onVideo = state.videoUrl && state.videoUrl.includes("netflix.com/watch");
-  const createBtn = document.getElementById("create");
   
-  document.getElementById("leave").classList.toggle("hidden", !inRoom);
+  leaveBtn.classList.toggle("hidden", !inRoom);
+  createBtn.classList.toggle("hidden", inRoom);
+  copyIdBtn.classList.toggle("hidden", !inRoom);
+  roomLinkInput.disabled = inRoom;
+  roomLinkInput.placeholder = inRoom ? "Connected · Room ID locked" : "Enter room ID";
   
   // Update create button state based on whether user is on a Netflix video
-  if (createBtn && state.session) {
-    createBtn.disabled = !onVideo;
-    if (!onVideo && !inRoom) {
-      createBtn.title = "Open a Netflix video to create a room";
-    } else {
-      createBtn.title = "";
-    }
+  if (createBtn) {
+    createBtn.disabled = !state.session || !onVideo || inRoom;
+    createBtn.title = !onVideo && !inRoom ? "Open a Netflix video to create a room" : "";
   }
+  copyIdBtn.disabled = !inRoom;
 }
 
 function isValidRoomId(roomId) {
@@ -681,6 +713,34 @@ function parseRoomId(input) {
   }
   
   return null;
+}
+
+async function handleAuthExpired() {
+  try {
+    await chrome.runtime.sendMessage({ type: "auth-clear" });
+  } catch (_) {
+    // Ignore
+  }
+  state.session = null;
+  applySession(null);
+  pushToast("Session expired. Please sign in again.", "warn");
+}
+
+async function copyRoomIdToClipboard(roomId = state.roomId) {
+  const value = (roomId || "").trim();
+  if (!value) {
+    jitterInput(roomLinkInput);
+    pushToast("No room ID to copy", "warn");
+    return false;
+  }
+  try {
+    await navigator.clipboard.writeText(value);
+    pushToast("Room ID copied", "info");
+    return true;
+  } catch (_) {
+    pushToast("Couldn't copy room ID", "warn");
+    return false;
+  }
 }
 
 function pushToast(text, variant = "info") {
@@ -737,7 +797,7 @@ function safeSendMessage(message, callback) {
   const urlRoom = parseRoomId(new URL(window.location.href).searchParams.get("room"));
   if (urlRoom) {
     state.pendingRoomId = urlRoom;
-    roomLinkInput.value = buildShareLink(urlRoom);
+    roomLinkInput.value = urlRoom;
     pushToast(`Link detected for room ${urlRoom}`, "info");
     if (state.session) {
       // Show preview instead of directly joining

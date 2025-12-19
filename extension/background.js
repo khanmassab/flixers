@@ -1,5 +1,5 @@
-const BACKEND_HTTP = "http://16.170.150.83";
-const BACKEND_WS = "ws://16.170.150.83/ws";
+const BACKEND_HTTP = "http://localhost:4000";
+const BACKEND_WS = "ws://localhost:4000/ws";
 const GOOGLE_CLIENT_ID = "400373504190-dasf4eoqp7oqaikurtq9b9gqi32oai6t.apps.googleusercontent.com";
 
 let ws;
@@ -238,6 +238,13 @@ let pendingSyncRequest = false;
 let syncRequestTimestamp = 0;
 let hasRespondedToSync = false;
 
+function isValidRoomId(roomId) {
+  if (!roomId || typeof roomId !== "string") return false;
+  const cleaned = roomId.trim();
+  if (cleaned.length < 3 || cleaned.length > 64) return false;
+  return /^[A-Za-z0-9_-]+$/.test(cleaned);
+}
+
 chrome.storage.local.get(["flixersSession"]).then((res) => {
   if (res.flixersSession) {
     session = res.flixersSession;
@@ -412,6 +419,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 async function handleJoin(roomId, name, token) {
+  const trimmedRoomId = (roomId || "").trim();
+  if (!isValidRoomId(trimmedRoomId)) {
+    return { ok: false, reason: "invalid-room" };
+  }
   if (token) {
     session = session || {};
     session.token = token;
@@ -424,7 +435,7 @@ async function handleJoin(roomId, name, token) {
   
   // Verify room exists (but don't auto-navigate)
   try {
-    const res = await fetch(`${BACKEND_HTTP}/rooms/${roomId}/join`, {
+    const res = await fetch(`${BACKEND_HTTP}/rooms/${trimmedRoomId}/join`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -432,6 +443,9 @@ async function handleJoin(roomId, name, token) {
       },
     });
     
+    if (res.status === 401) {
+      return { ok: false, reason: "auth-required" };
+    }
     if (!res.ok) {
       const error = await res.json().catch(() => ({ error: "join_failed" }));
       return { ok: false, reason: error.error || "join_failed" };
@@ -444,7 +458,7 @@ async function handleJoin(roomId, name, token) {
   }
   
   // Clear keys from old room if changing rooms
-  if (currentRoom && currentRoom !== roomId) {
+  if (currentRoom && currentRoom !== trimmedRoomId) {
     clearPersistedKeys(currentRoom);
     clearPersistedQueue(currentRoom);
     clearMessageQueue(false);
@@ -456,19 +470,23 @@ async function handleJoin(roomId, name, token) {
   lastEpisodePath = null;
   lastVideoUrl = null;
   lastVideoTitle = null;
-  currentRoom = roomId;
+  currentRoom = trimmedRoomId;
   await loadPersistedQueue(currentRoom);
   pendingSyncRequest = false;
   hasRespondedToSync = false;
-  sendToNetflixTabs({ type: "room-update", roomId, name: displayName, id: displayId });
+  sendToNetflixTabs({ type: "room-update", roomId: currentRoom, name: displayName, id: displayId });
   connectSocket();
   emitLocalSystem("Joined the room");
-  console.log(`[Sync] Joined room ${roomId} as creator/host`);
-  return { ok: true, roomId };
+  console.log(`[Sync] Joined room ${currentRoom} as creator/host`);
+  return { ok: true, roomId: currentRoom };
 }
 
 // User-gesture-gated join: opens Netflix tab then joins
 async function handleConfirmJoin(roomId, name, token, videoUrl, initialTime) {
+  const trimmedRoomId = (roomId || "").trim();
+  if (!isValidRoomId(trimmedRoomId)) {
+    return { ok: false, reason: "invalid-room" };
+  }
   if (token) {
     session = session || {};
     session.token = token;
@@ -483,7 +501,7 @@ async function handleConfirmJoin(roomId, name, token, videoUrl, initialTime) {
   
   // Verify room exists
   try {
-    const res = await fetch(`${BACKEND_HTTP}/rooms/${roomId}/join`, {
+    const res = await fetch(`${BACKEND_HTTP}/rooms/${trimmedRoomId}/join`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -491,6 +509,9 @@ async function handleConfirmJoin(roomId, name, token, videoUrl, initialTime) {
       },
     });
     
+    if (res.status === 401) {
+      return { ok: false, reason: "auth-required" };
+    }
     if (!res.ok) {
       const error = await res.json().catch(() => ({ error: "join_failed" }));
       return { ok: false, reason: error.error || "join_failed" };
@@ -506,7 +527,7 @@ async function handleConfirmJoin(roomId, name, token, videoUrl, initialTime) {
   }
   
   // Clear keys from old room if changing rooms
-  if (currentRoom && currentRoom !== roomId) {
+  if (currentRoom && currentRoom !== trimmedRoomId) {
     clearPersistedKeys(currentRoom);
     clearPersistedQueue(currentRoom);
     clearMessageQueue(false);
@@ -518,21 +539,21 @@ async function handleConfirmJoin(roomId, name, token, videoUrl, initialTime) {
   lastEpisodePath = null;
   lastVideoUrl = null;
   lastVideoTitle = null;
-  currentRoom = roomId;
+  currentRoom = trimmedRoomId;
   await loadPersistedQueue(currentRoom);
   pendingSyncRequest = true; // Will request sync once connected
   hasRespondedToSync = false;
   
   // Send room-update with retries (content script might not be ready immediately)
-  sendToNetflixTabs({ type: "room-update", roomId, name: displayName, id: displayId });
-  setTimeout(() => sendToNetflixTabs({ type: "room-update", roomId, name: displayName, id: displayId }), 1000);
-  setTimeout(() => sendToNetflixTabs({ type: "room-update", roomId, name: displayName, id: displayId }), 3000);
-  setTimeout(() => sendToNetflixTabs({ type: "room-update", roomId, name: displayName, id: displayId }), 5000);
+  sendToNetflixTabs({ type: "room-update", roomId: currentRoom, name: displayName, id: displayId });
+  setTimeout(() => sendToNetflixTabs({ type: "room-update", roomId: currentRoom, name: displayName, id: displayId }), 1000);
+  setTimeout(() => sendToNetflixTabs({ type: "room-update", roomId: currentRoom, name: displayName, id: displayId }), 3000);
+  setTimeout(() => sendToNetflixTabs({ type: "room-update", roomId: currentRoom, name: displayName, id: displayId }), 5000);
   
   connectSocket();
   emitLocalSystem("Joined the room");
-  console.log(`[Sync] Joined room ${roomId}, will request sync when video ready`);
-  return { ok: true, roomId };
+  console.log(`[Sync] Joined room ${currentRoom}, will request sync when video ready`);
+  return { ok: true, roomId: currentRoom };
 }
 
 // Open Netflix video tab (called from user gesture in popup)
@@ -637,11 +658,12 @@ async function connectSocket() {
     
     startHeartbeat();
 
-    // Request a fresh sync when we reconnect to avoid drift
-    setTimeout(() => {
-      pendingSyncRequest = true;
-      sendSyncRequest();
-    }, 600);
+	    // Only request sync if we explicitly need it (e.g., joiner flow or manual resync).
+	    if (pendingSyncRequest) {
+	      setTimeout(() => {
+	        sendSyncRequest();
+	      }, 600);
+	    }
 
     // Re-send our latest outbound playback state to help others catch up
     if (lastOutboundState) {
@@ -975,7 +997,8 @@ function routeIncoming(message) {
       type: "apply-state",
       payload: {
         ...message.payload,
-        reason: "sync",  // Mark as sync so content script applies it
+        // Preserve the original reason (play/pause/seek/sync) so joiners don't "pull" everyone back.
+        reason: message.payload?.reason || "sync",
         from: message.from || "peer",
       },
     });
@@ -1077,6 +1100,19 @@ function routeIncoming(message) {
       from: message.from,
       reason: message.reason,
     });
+    const wasUrl = lastVideoUrl;
+    const getWatchPath = (url) => {
+      if (!url) return null;
+      try {
+        return new URL(url).pathname;
+      } catch (_) {
+        return null;
+      }
+    };
+    const targetPath = getWatchPath(message.url);
+    const currentPath = getWatchPath(wasUrl);
+    const alreadyOnEpisode =
+      !!targetPath && targetPath.includes("/watch/") && !!currentPath && currentPath === targetPath;
     if (message.url) {
       lastVideoUrl = message.url;
       lastVideoTitle = message.title || null;
@@ -1093,20 +1129,23 @@ function routeIncoming(message) {
       title: message.title || null,
     };
     sendToNetflixTabs(episodePayload);
-    // Also send an apply-state resync payload to force navigation on peers
-    sendToNetflixTabs({
-      type: "apply-state",
-      payload: {
-        url: message.url,
-        ts: message.ts,
-        from: message.from,
-        fromId: message.fromId,
-        seq: message.seq,
-        reason: "resync",
-      },
-    });
-    // Final guard: navigate the active Netflix tab directly
-    navigateToVideo(message.url);
+    if (!alreadyOnEpisode) {
+      // Only force navigation when we are not already on the target /watch path.
+      sendToNetflixTabs({
+        type: "apply-state",
+        payload: {
+          url: message.url,
+          ts: message.ts,
+          from: message.from,
+          fromId: message.fromId,
+          seq: message.seq,
+          reason: "resync",
+        },
+      });
+      navigateToVideo(message.url);
+    } else {
+      console.log("[Episode] Skipping navigation/apply-state: already on target path", targetPath);
+    }
   }
   
   // Sync handshake: someone is requesting sync state
@@ -1859,18 +1898,32 @@ function navigateToVideo(url) {
         chrome.tabs.create({ url });
         return;
       }
-      const [first] = tabs;
-      if (first && first.id) {
-        chrome.tabs.update(first.id, { url }).catch(() => {
+      let targetPath = null;
+      try {
+        targetPath = new URL(url).pathname;
+      } catch (_) {
+        targetPath = null;
+      }
+      const targetTab = tabs.find((tab) => tab.active) || tabs[0];
+      if (targetTab && targetTab.url && targetPath) {
+        try {
+          const currentPath = new URL(targetTab.url).pathname;
+          if (currentPath === targetPath) {
+            return;
+          }
+        } catch (_) {}
+      }
+      if (targetTab && targetTab.id) {
+        chrome.tabs.update(targetTab.id, { url }).catch(() => {
           // Fallback: force navigation via scripting in case update is blocked
           try {
             chrome.scripting.executeScript({
-              target: { tabId: first.id, allFrames: true },
+              target: { tabId: targetTab.id, allFrames: true },
               func: (nextUrl) => {
                 try {
-                  if (window.location.href !== nextUrl) {
-                    window.location.href = nextUrl;
-                  }
+                  const currentPath = window.location.pathname;
+                  const nextPath = new URL(nextUrl).pathname;
+                  if (currentPath !== nextPath) window.location.href = nextUrl;
                 } catch (_) {}
               },
               args: [url],

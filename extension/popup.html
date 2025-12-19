@@ -32,12 +32,15 @@
         </div>
         <div class="field-grid">
           <label>
-            Room link (share)
+            Room ID
             <div class="share-row">
-              <input id="room-link" type="text" placeholder="Paste room link or ID" />
-              <button id="create" type="button" class="pill-btn">Create new room</button>
+              <input id="room-link" type="text" placeholder="Enter room ID" />
+              <div class="share-actions">
+                <button id="create" type="button" class="pill-btn muted">Create room</button>
+                <button id="copy-room-id" type="button" class="pill-btn muted hidden">Copy ID</button>
+              </div>
             </div>
-            <p class="hint">Paste a shared link to join instantly, or create a new room.</p>
+            <p class="hint">Paste a room ID to join. Once connected, copy the ID to share.</p>
           </label>
         </div>
         
@@ -53,13 +56,13 @@
             </div>
           </div>
           <div class="preview-actions">
-            <button id="confirm-join" class="pill-btn pill-btn--large">Join &amp; Open Video</button>
+            <button id="confirm-join" class="pill-btn pill-btn--accent pill-btn--large">Join &amp; Open Video</button>
             <button id="cancel-join" class="muted">Cancel</button>
           </div>
         </div>
         
         <div class="actions">
-          <button id="leave" class="muted hidden">Leave</button>
+          <button id="leave" class="pill-btn pill-btn--accent hidden">Leave room</button>
         </div>
         <div class="status-row">
           <div>
